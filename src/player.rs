@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context};
 use ruffle_core::backend::navigator::{OwnedFuture, SocketMode};
 use ruffle_core::config::Letterbox;
+use ruffle_core::font::DefaultFont;
 use ruffle_core::{Player, PlayerBuilder};
 use ruffle_frontend_utils::backends::audio::CpalAudioBackend;
 use ruffle_frontend_utils::backends::navigator::{
@@ -152,21 +153,62 @@ pub fn build_player(
 
     {
         let mut player_lock = player.lock().unwrap();
-        let movie_size = movie_size.clone();
-        player_lock.fetch_root_movie(
-            GAME_URL.to_string(),
-            Vec::new(),
-            Box::new(move |header| {
-                let stage = header.stage_size();
-                *movie_size.lock().unwrap() = Some((
-                    twips_to_pixels(stage.width().get()),
-                    twips_to_pixels(stage.height().get()),
-                ));
-            }),
+        // Map the SWF's generic `_sans`/`_serif`/`_typewriter` device fonts to
+        // real system fonts, mirroring ruffle_desktop (each name is tried in
+        // order until one is found in the font database).
+        player_lock.set_default_font(
+            DefaultFont::Serif,
+            vec![
+                "Times New Roman".into(),
+                "Tinos".into(),
+                "Liberation Serif".into(),
+                "DejaVu Serif".into(),
+            ],
+        );
+        player_lock.set_default_font(
+            DefaultFont::Sans,
+            vec![
+                "Arial".into(),
+                "Arimo".into(),
+                "Liberation Sans".into(),
+                "DejaVu Sans".into(),
+            ],
+        );
+        player_lock.set_default_font(
+            DefaultFont::Typewriter,
+            vec![
+                "Courier New".into(),
+                "Cousine".into(),
+                "Liberation Mono".into(),
+                "DejaVu Sans Mono".into(),
+            ],
         );
     }
 
+    refetch_root_movie(&player, &movie_size);
+
     Ok((player, movie_target))
+}
+
+/// Kicks off (or re-kicks off, after a failed download) the root movie fetch,
+/// recording the SWF stage size into `movie_size` once the header arrives.
+pub fn refetch_root_movie(
+    player: &Arc<Mutex<Player>>,
+    movie_size: &Arc<Mutex<Option<(u32, u32)>>>,
+) {
+    let mut player_lock = player.lock().unwrap();
+    let movie_size = movie_size.clone();
+    player_lock.fetch_root_movie(
+        GAME_URL.to_string(),
+        Vec::new(),
+        Box::new(move |header| {
+            let stage = header.stage_size();
+            *movie_size.lock().unwrap() = Some((
+                twips_to_pixels(stage.width().get()),
+                twips_to_pixels(stage.height().get()),
+            ));
+        }),
+    );
 }
 
 #[cfg(test)]
