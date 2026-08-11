@@ -5,7 +5,7 @@
 - [x] 3. Ask clarifying questions (one at a time)
 - [x] 4. Propose 2-3 approaches with trade-offs
 - [x] 5. Present design in sections, get approval per section
-- [ ] 6. Write design doc to docs/superpowers/specs/
-- [ ] 7. Spec self-review (placeholders, consistency, scope, ambiguity)
-- [ ] 8. User reviews written spec
-- [ ] 9. Transition to writing-plans skill
+- [x] 6. Write design doc to docs/superpowers/specs/
+- [x] 7. Spec self-review (placeholders, consistency, scope, ambiguity)
+- [x] 8. User reviews written spec
+- [x] 9. Transition to writing-plans skill
