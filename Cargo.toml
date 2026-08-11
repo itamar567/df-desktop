@@ -18,7 +18,9 @@ ruffle_core = { version = "0.4.1", path = "../ruffle/core", features = ["audio",
 ruffle_frontend_utils = { version = "0.4.1", path = "../ruffle/frontend-utils", features = ["cpal", "fs", "navigator"] }
 ruffle_render_wgpu = { version = "0.4.1", path = "../ruffle/render/wgpu" }
 ruffle_video_software = { version = "0.4.1", path = "../ruffle/video/software" }
+serde = { version = "1.0.229", features = ["derive"] }
 sys-locale = "0.3.2"
+toml = "1.1.4"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = "0.3.23"
@@ -31,3 +33,6 @@ winit = "0.30"
 # crates.io copy (which would cause type mismatches).
 [patch.crates-io]
 swf = { path = "../ruffle/swf" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
