@@ -1,0 +1,33 @@
+[package]
+name = "ruffle-dragonfable"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+arboard = "3.6.1"
+async-task = "4.7.1"
+dirs = "6.0.0"
+dragonfable-cache = { version = "0.1.0", path = "../df-cache-layer" }
+egui = "0.33"
+egui-wgpu = "0.33"
+egui-winit = "0.33"
+fontdb = "0.24.0"
+futures = "0.3.34"
+ruffle_core = { version = "0.4.1", path = "../ruffle/core", features = ["audio", "mp3", "aac", "nellymoser", "lzma", "default_compatibility_rules"] }
+ruffle_frontend_utils = { version = "0.4.1", path = "../ruffle/frontend-utils", features = ["cpal", "fs", "navigator"] }
+ruffle_render_wgpu = { version = "0.4.1", path = "../ruffle/render/wgpu" }
+ruffle_video_software = { version = "0.4.1", path = "../ruffle/video/software" }
+sys-locale = "0.3.2"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = "0.3.23"
+url = "2.5.8"
+webbrowser = "1.2.4"
+wgpu = "27"
+winit = "0.30"
+
+# The in-tree swf fork must be used everywhere, so no dependency pulls the
+# crates.io copy (which would cause type mismatches).
+[patch.crates-io]
+swf = { path = "../ruffle/swf" }
