@@ -2,17 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A bare-minimum DragonFable-only desktop player (Linux/Windows) built on the Ruffle fork, using the `dragonfable-cache` navigator wrapper whose cache files are now AES-128-GCM-obfuscated, with a first-boot disclaimer and save-data migration setup screen.
+**Goal:** A bare-minimum DragonFable-only desktop player (Linux/Windows) built on the Ruffle fork, using the `dragonfable-cache` navigator wrapper whose cache files are now AES-CTR + HMAC-SHA256-obfuscated, with a first-boot disclaimer and save-data migration setup screen.
 
 **Architecture:** Two independent crates. (A) `df-cache-layer/` gains an encryption module (`cipher.rs`) and the cache read/write paths are reworked to stream through it (magic-header format, always-on for both Android and desktop). (B) `desktop/` becomes a new standalone bin crate (`ruffle-dragonfable`) with modules `main/app/player/ui/navigator/config/migration`, modeling the proven ruffle_desktop patterns (winit 0.30 + wgpu 27 + egui 0.33, `WinitExecutor` FutureSpawner, `ExternalNavigatorBackend` wrapped in `DragonFableCachingNavigator`). The ruffle fork tree is not modified.
 
-**Tech Stack:** Rust (edition 2024), winit, wgpu, egui/egui-wgpu/egui-winit, cpal (via ruffle_frontend_utils), fontdb, dirs, tracing, AES-128-GCM (aes-gcm crate), tokio (dev-only, tests), url, anyhow, async-task, arboard, webbrowser, sys-locale.
+**Tech Stack:** Rust (edition 2024), winit, wgpu, egui/egui-wgpu/egui-winit, cpal (via ruffle_frontend_utils), fontdb, dirs, tracing, AES-128-CTR + HMAC-SHA256 (aes, ctr, hmac, sha2 crates), tokio (dev-only, tests), url, anyhow, async-task, arboard, webbrowser, sys-locale.
 
 ## Global Constraints
 
 - Game URL is hardcoded: `https://play.dragonfable.com/game/DFLoader.swf`. **No CLI args at all** (no URL override, no flags).
 - Cache max: **512 MB** on desktop (`CACHE_MAX_BYTES = 512 * 1024 * 1024`). Android keeps 256 MB.
-- Cache encryption: AES-128-GCM, key = literal bytes `ZorbakOwnsYou` zero-padded to 16 bytes. **Always on, no flag** — Android and desktop alike. On-disk format: magic `DFCACHE\x00\x01` (8) + nonce (12) + ciphertext + tag (16). Legacy raw-format cache files self-heal: detected via bad magic → deleted → cache miss.
+- Cache encryption: AES-128-CTR keystream with an HMAC-SHA256 tag (encrypt-then-MAC), key = literal bytes `ZorbakOwnsYou` zero-padded to 16 bytes, used for both CTR and HMAC. **Always on, no flag** — Android and desktop alike. On-disk format: magic `DFCACHE\x00` (8) + nonce (12) + ciphertext + HMAC-SHA256 tag (32). Constant overhead 52 bytes; plaintext length = on-disk size − 52. Streams in 64KB chunks with bounded memory; the HMAC covers the ciphertext and is verified at EOF, so corruption/truncation is detected (loud error, never silent garbage). Legacy raw-format cache files self-heal: detected via bad magic → deleted → cache miss. (Chosen over GCM after the plan review: the aes-gcm crate's streaming API tags every segment, which breaks constant-overhead streaming; CTR+HMAC gives constant overhead + true streaming.)
 - Directories via the `dirs` crate (XDG on Linux, `%APPDATA%`/`%LOCALAPPDATA%` on Windows): cache `dirs::cache_dir()/dragonfable`, saves `dirs::data_local_dir()/dragonfable/SharedObjects`, app state `state.toml` in `dirs::config_local_dir()/dragonfable/`, logs in `dirs::data_local_dir()/dragonfable/log/`.
 - `base_domain` for the caching navigator: `play.dragonfable.com`.
 - First-boot flow: (1) disclaimer screen (text: "This is a 3rd party launcher that is not supported nor endorsed by Artix Entertainment. By clicking 'Continue', you agree to use this launcher at your own risk.") → Continue → (2) if any migration source has save data, a setup screen listing each detected source with one button each plus "Don't copy" → (3) game. Both choices persist in `state.toml`; neither screen is ever shown again.
@@ -26,7 +26,7 @@
 ## File Structure
 
 **`/workspace/df-cache-layer`** (existing crate, own git repo, branch `master`):
-- Create: `src/cipher.rs` — AES-GCM obfuscation primitives: `EncryptingWriter`, `DecryptingReader`, magic/format constants, key/nonce derivation.
+- Create: `src/cipher.rs` — AES-CTR + HMAC-SHA256 obfuscation primitives: `EncryptingWriter`, `DecryptingReader`, magic/format constants, key/nonce derivation.
 - Modify: `src/cache.rs` — `CacheWriter` encrypts + finalizes tag; `Cache::open` validates magic, returns decrypting reader + plaintext length; wipe-comparison reads decrypted bytes; tests updated/added.
 - Modify: `src/lib.rs` — `CachedBody::File` uses the new `CacheFile` type; `expected_length` = plaintext length.
 - Modify: `Cargo.toml` — add `aes-gcm` (features `stream`, `alloc`) and `getrandom`.
@@ -51,21 +51,24 @@ Work in `/workspace/df-cache-layer`.
 **Interfaces:**
 - Consumes: nothing (standalone).
 - Produces:
-  - `pub(crate) const MAGIC: &[u8; 8]` = `b"DFCACHE\x00\x01"`
+  - `pub(crate) const MAGIC: &[u8; 8]` = `b"DFCACHE\x00"`
   - `pub(crate) const NONCE_LEN: usize` = 12
+  - `pub(crate) const TAG_LEN: usize` = 32 (HMAC-SHA256)
   - `pub(crate) const HEADER_LEN: usize` = 20 (magic + nonce)
-  - `pub(crate) const OVERHEAD: usize` = 36 (header + tag)
+  - `pub(crate) const OVERHEAD: usize` = 52 (header + tag)
   - `pub(crate) fn random_nonce() -> [u8; 12]`
-  - `pub(crate) struct EncryptingWriter<W: Write>` with `new(inner: W, nonce: [u8; 12]) -> Self`, `write(&mut self, bytes: &[u8]) -> io::Result<()>`, `finish(self) -> io::Result<W>` (writes final GCM tag, flushes, returns inner)
-  - `pub(crate) struct DecryptingReader<R: Read>` with `new(inner: R, nonce: [u8; 12]) -> Self`, implementing `Read` (streams decryption, verifies the tag at EOF, errors on corruption/truncation)
+  - `pub(crate) struct EncryptingWriter<W: Write>` with `new(inner: W, nonce: [u8; 12]) -> Self`, `write(&mut self, bytes: &[u8]) -> io::Result<()>`, `finish(self) -> io::Result<W>` (writes the HMAC tag, flushes, returns inner)
+  - `pub(crate) struct DecryptingReader<R: Read>` with `new(inner: R, nonce: [u8; 12]) -> Self`, implementing `Read` (streams decryption with bounded memory, verifies the HMAC at EOF, errors on corruption/truncation)
 
 - [ ] **Step 1: Add dependencies**
 
 ```bash
 cd /workspace/df-cache-layer
-cargo add aes-gcm --features stream,alloc
+cargo add aes ctr hmac sha2
 cargo add getrandom
 ```
+
+(`ctr` re-exports the `cipher` traits `KeyIvInit`/`StreamCipher`; `hmac` 0.12 and `sha2` 0.10 with default features. All resolve to latest.)
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -78,8 +81,13 @@ mod tests {
     use std::io::{Read, Write};
 
     fn obfuscate(bytes: &[u8]) -> Vec<u8> {
+        // Replicates `Cache::begin_write` (Task 2): the caller writes
+        // `MAGIC || nonce`; the writer itself is header-less.
         let nonce = random_nonce();
-        let mut writer = EncryptingWriter::new(Vec::new(), nonce);
+        let mut file = Vec::new();
+        file.extend_from_slice(MAGIC);
+        file.extend_from_slice(&nonce);
+        let mut writer = EncryptingWriter::new(file, nonce);
         writer.write(bytes).unwrap();
         writer.finish().unwrap()
     }
@@ -152,39 +160,40 @@ Expected: FAIL — module/type not found (`EncryptingWriter`, `DecryptingReader`
 Write `src/cipher.rs`:
 
 ```rust
-//! AES-128-GCM obfuscation for cached files ("DFCACHE" format).
+//! AES-128-CTR + HMAC-SHA256 obfuscation for cached files ("DFCACHE" format).
 //!
-//! On-disk layout: `DFCACHE\x00\x01` magic (8 bytes) || 12-byte nonce ||
-//! ciphertext || 16-byte GCM tag.
+//! On-disk layout: `DFCACHE\x00` magic (8 bytes) || 12-byte nonce ||
+//! AES-CTR ciphertext || 32-byte HMAC-SHA256 tag.
 //!
-//! This is obfuscation, not security: the passphrase matches DragonFable's
-//! own obfuscation key and is compiled into the binary.
+//! Encrypt-then-MAC: the tag covers the ciphertext and is verified at EOF, so
+//! corrupted or truncated entries fail loudly instead of decrypting to garbage.
+//! This is obfuscation, not security: the passphrase matches DragonFable's own
+//! obfuscation key and is compiled into the binary.
 
 use std::io::{self, Read, Write};
 
-use aes_gcm::stream::{AeadStream, DecryptorBE32, EncryptorBE32};
-use aes_gcm::{Aes128Gcm, Key};
+use aes::Aes128;
+use ctr::cipher::{KeyIvInit, StreamCipher};
+use ctr::Ctr128BE;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
-pub(crate) const MAGIC: &[u8; 8] = b"DFCACHE\x00\x01";
+pub(crate) const MAGIC: &[u8; 8] = b"DFCACHE\x00";
 pub(crate) const NONCE_LEN: usize = 12;
-pub(crate) const TAG_LEN: usize = 16;
+pub(crate) const TAG_LEN: usize = 32;
 pub(crate) const HEADER_LEN: usize = MAGIC.len() + NONCE_LEN;
 pub(crate) const OVERHEAD: usize = HEADER_LEN + TAG_LEN;
 
-/// The stream API's per-call payload limit; kept to 64KB minus one block so
-/// calls stay block-aligned and safely under the limit.
-const CHUNK_LIMIT: usize = 64 * 1024 - 16;
-
 const PASSPHRASE: &[u8; 13] = b"ZorbakOwnsYou";
 
-fn passphrase_key() -> Key<Aes128Gcm> {
+fn passphrase_key() -> [u8; 16] {
     let mut key = [0u8; 16];
     key[..PASSPHRASE.len()].copy_from_slice(PASSPHRASE);
-    *Key::<Aes128Gcm>::from_slice(&key)
+    key
 }
 
-/// BE32 stream mode takes a 16-byte initial counter: the 12-byte nonce plus a
-/// big-endian 32-bit block counter starting at 0.
+/// CTR's 16-byte initial counter block: the 12-byte nonce plus a big-endian
+/// 32-bit block counter starting at 0.
 fn counter_block(nonce: &[u8; NONCE_LEN]) -> [u8; 16] {
     let mut block = [0u8; 16];
     block[..NONCE_LEN].copy_from_slice(nonce);
@@ -197,45 +206,36 @@ pub(crate) fn random_nonce() -> [u8; NONCE_LEN] {
     nonce
 }
 
-fn io_error(error: impl std::fmt::Display) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-}
-
-/// Streams plaintext through AES-128-GCM into the wrapped writer, buffering
-/// partial blocks so every `encrypt_next` call is block-aligned. `finish`
-/// emits the final GCM tag (appended to the ciphertext).
+/// Streams plaintext through AES-128-CTR into the wrapped writer, feeding the
+/// ciphertext into an incremental HMAC-SHA256. `finish` appends the tag.
+///
+/// Header-less: the caller (`Cache::begin_write`) writes `MAGIC || nonce`
+/// before construction.
 pub(crate) struct EncryptingWriter<W: Write> {
     inner: W,
-    encryptor: EncryptorBE32<Aes128Gcm>,
-    pending: Vec<u8>,
+    cipher: Ctr128BE<Aes128>,
+    mac: Hmac<Sha256>,
 }
 
 impl<W: Write> EncryptingWriter<W> {
     pub(crate) fn new(inner: W, nonce: [u8; NONCE_LEN]) -> Self {
-        let cipher = Aes128Gcm::new(&passphrase_key());
-        let encryptor = EncryptorBE32::from_aead(cipher, &counter_block(&nonce).into());
+        let key = passphrase_key();
         Self {
             inner,
-            encryptor,
-            pending: Vec::new(),
+            cipher: Ctr128BE::<Aes128>::new(&key.into(), &counter_block(&nonce).into()),
+            mac: Hmac::<Sha256>::new_from_slice(&key).expect("16-byte HMAC key is valid"),
         }
     }
 
     pub(crate) fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.pending.extend_from_slice(bytes);
-        let feed = (self.pending.len() / 16 * 16).min(CHUNK_LIMIT);
-        if feed > 0 {
-            let chunk: Vec<u8> = self.pending.drain(..feed).collect();
-            let encrypted = self.encryptor.encrypt_next(&chunk).map_err(io_error)?;
-            self.inner.write_all(&encrypted)?;
-        }
-        Ok(())
+        let mut encrypted = bytes.to_vec();
+        self.cipher.apply_keystream(&mut encrypted);
+        self.mac.update(&encrypted);
+        self.inner.write_all(&encrypted)
     }
 
     pub(crate) fn finish(mut self) -> io::Result<W> {
-        let tail = std::mem::take(&mut self.pending);
-        let encrypted = self.encryptor.encrypt_last(&tail).map_err(io_error)?;
-        self.inner.write_all(&encrypted)?;
+        self.inner.write_all(&self.mac.finalize().into_bytes())?;
         self.inner.flush()?;
         Ok(self.inner)
     }
@@ -243,13 +243,13 @@ impl<W: Write> EncryptingWriter<W> {
 
 /// Streams decryption of a "DFCACHE" payload (everything after the header).
 ///
-/// GCM needs the tag verified against the full ciphertext, so the final
-/// partial block plus the 16-byte tag are held back until EOF; the last
-/// read then runs `decrypt_last`, which fails loudly on any corruption or
-/// truncation.
+/// Holds back the trailing 32 bytes (the tag) while decoding the ciphertext
+/// in bounded memory; the final read verifies the HMAC over the full
+/// ciphertext, failing loudly on any corruption or truncation.
 pub(crate) struct DecryptingReader<R: Read> {
     inner: R,
-    decryptor: Option<DecryptorBE32<Aes128Gcm>>,
+    cipher: Ctr128BE<Aes128>,
+    mac: Hmac<Sha256>,
     pending: Vec<u8>,
     out: Vec<u8>,
     out_pos: usize,
@@ -258,11 +258,11 @@ pub(crate) struct DecryptingReader<R: Read> {
 
 impl<R: Read> DecryptingReader<R> {
     pub(crate) fn new(inner: R, nonce: [u8; NONCE_LEN]) -> Self {
-        let cipher = Aes128Gcm::new(&passphrase_key());
-        let decryptor = DecryptorBE32::from_aead(cipher, &counter_block(&nonce).into());
+        let key = passphrase_key();
         Self {
             inner,
-            decryptor: Some(decryptor),
+            cipher: Ctr128BE::<Aes128>::new(&key.into(), &counter_block(&nonce).into()),
+            mac: Hmac::<Sha256>::new_from_slice(&key).expect("16-byte HMAC key is valid"),
             pending: Vec::new(),
             out: Vec::new(),
             out_pos: 0,
@@ -270,50 +270,43 @@ impl<R: Read> DecryptingReader<R> {
         }
     }
 
-    /// Reads more ciphertext, decrypting everything that is guaranteed not to
-    /// belong to the final segment (final partial block + tag, ≤ 31 bytes).
+    /// Reads more ciphertext, decoding everything that is guaranteed not to
+    /// be the trailing tag.
     fn fill(&mut self) -> io::Result<()> {
         let mut chunk = [0u8; 64 * 1024];
         let read = self.inner.read(&mut chunk)?;
         self.pending.extend_from_slice(&chunk[..read]);
         if read == 0 {
-            let decryptor = self.decryptor.take().expect("decryptor exists once");
-            let tail = std::mem::take(&mut self.pending);
-            let (feed, last) = split_final_segment(&tail);
-            let mut plaintext = Vec::new();
-            if !feed.is_empty() {
-                plaintext.extend(decryptor.decrypt_next(feed).map_err(io_error)?);
+            // EOF: the last 32 bytes are the tag, the rest the final
+            // ciphertext (usually empty — mid-stream feeds already consumed
+            // everything but the tag).
+            let split = self.pending.len().saturating_sub(TAG_LEN);
+            let (body, tag) = self.pending.split_at(split);
+            let mut plaintext = body.to_vec();
+            self.cipher.apply_keystream(&mut plaintext);
+            self.mac.update(body);
+            let expected = self.mac.clone().finalize().into_bytes();
+            if expected.as_slice() != tag {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cache entry failed integrity check",
+                ));
             }
-            plaintext.extend(decryptor.decrypt_last(&last).map_err(io_error)?);
             self.out = plaintext;
             self.out_pos = 0;
             self.finished = true;
             return Ok(());
         }
-        if self.pending.len() > 31 {
-            let feed = (self.pending.len() - 31) / 16 * 16;
-            if feed > 0 {
-                let chunk: Vec<u8> = self.pending.drain(..feed).collect();
-                let plaintext = self
-                    .decryptor
-                    .as_mut()
-                    .expect("decryptor exists")
-                    .decrypt_next(&chunk)
-                    .map_err(io_error)?;
-                self.out = plaintext;
-                self.out_pos = 0;
-            }
+        if self.pending.len() > TAG_LEN {
+            let feed = self.pending.len() - TAG_LEN;
+            let body: Vec<u8> = self.pending.drain(..feed).collect();
+            let mut plaintext = body.clone();
+            self.cipher.apply_keystream(&mut plaintext);
+            self.mac.update(&body);
+            self.out = plaintext;
+            self.out_pos = 0;
         }
         Ok(())
-    }
-
-    /// Splits the tail into block-aligned bytes to feed to `decrypt_next` and
-    /// the final segment (partial block + tag) for `decrypt_last`.
-    fn split_final_segment<'a>(tail: &'a [u8]) -> (&'a [u8], &'a [u8]) {
-        let total = tail.len();
-        let final_segment_len = 16 + (total.saturating_sub(16) % 16);
-        let feed_len = total.saturating_sub(final_segment_len);
-        (&tail[..feed_len], &tail[feed_len..])
     }
 }
 
@@ -341,7 +334,7 @@ impl<R: Read> Read for DecryptingReader<R> {
 }
 ```
 
-Notes for the implementer: the `stream` API's exact `from_aead` argument type may differ slightly across aes-gcm releases (`&[u8; 16].into()` matches the crate docs) — check `cargo doc -p aes-gcm` if the signature errors. `decrypt_last` receives `final_partial_block || tag` and returns the last plaintext bytes while verifying the tag; `decrypt_next` requires block-aligned (multiple of 16) input. `split_final_segment` is a free function so it can be unit-tested if desired; the `roundtrip_across_sizes_and_chunk_boundaries` test already exercises all its edge cases (0, 15, 16, 17 byte payloads ⇒ final segments of 16, 31, 16, 17 bytes respectively).
+Notes for the implementer: `Ctr128BE::<Aes128>::new(&key.into(), &iv.into())` takes 16-byte `GenericArray`s — `.into()` from `[u8; 16]` works. `apply_keystream` (from `ctr::cipher::StreamCipher`) mutates in place and advances the keystream position, so successive calls continue seamlessly. `Hmac::<Sha256>` implements `Clone`, which the EOF verify uses to avoid consuming the running MAC. If exact trait paths differ across the resolved crate versions, check `cargo doc -p ctr -p hmac -p sha2`. Bounded memory: at most one 64KB chunk plus the 32 held-back tag bytes.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -352,8 +345,8 @@ Expected: all cipher tests PASS.
 
 ```bash
 cd /workspace/df-cache-layer
-git add Cargo.toml Cargo.lock src/cipher.rs
-git commit -m "Add AES-128-GCM obfuscation for cached files"
+git add Cargo.toml Cargo.lock src/cipher.rs src/lib.rs
+git commit -m "Add AES-CTR + HMAC obfuscation for cached files"
 ```
 
 ---
@@ -387,7 +380,7 @@ async fn evicts_oldest_when_over_cap() {
     cache.write("aaa", b"123456", true).await;
     cache.write("bbb", b"123456", true).await;
     cache.write("ccc", b"123456", true).await;
-    // Every entry is 42 bytes on disk (36 bytes of encryption overhead +
+    // Every entry is 58 bytes on disk (52 bytes of encryption overhead +
     // 6 bytes of payload), so none can fit under the 12-byte budget.
     assert!(cache.len("aaa").await.is_none());
     assert!(cache.len("bbb").await.is_none());

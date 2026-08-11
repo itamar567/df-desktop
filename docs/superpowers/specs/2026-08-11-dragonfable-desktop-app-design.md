@@ -87,20 +87,22 @@ fullscreen, no-op virtual keyboard, fonts via `fontdb`, file dialogs → `None`.
 New module `src/cipher.rs` (existing `decrypt.rs` untouched — still used for POST form
 data):
 
-- **AES-128-GCM** (`aes-gcm` with `stream` feature), key = literal passphrase
-  `"ZorbakOwnsYou"` zero-padded to 16 bytes. Obfuscation, not security — chosen over
-  plain CTR for integrity detection (truncated/corrupt files are detected, not silently
-  garbled).
+- **AES-128-CTR keystream + HMAC-SHA256 tag** (encrypt-then-MAC), key = literal passphrase
+  `"ZorbakOwnsYou"` zero-padded to 16 bytes, used for both the keystream and the MAC. Chosen
+  over GCM after plan review: the aes-gcm crate's streaming API tags every segment, which
+  breaks constant-overhead streaming; CTR+HMAC gives true streaming with constant overhead.
+  Integrity (corruption/truncation detection) is preserved via the HMAC verified at EOF —
+  chosen over plain CTR for the same reason GCM was originally preferred.
 - **12-byte random nonce** per file (`getrandom`).
-- **On-disk format:** `DFCACHE\x00\x01` magic (8 bytes) + nonce (12) + ciphertext +
-  tag (16). Magic lets stale files (e.g. legacy raw-format caches on Android devices) be
-  detected → deleted → treated as cache miss (re-downloaded); version byte future-proofs
-  format changes.
-- Plaintext length = on-disk size − 8 − 12 − 16, known from metadata.
+- **On-disk format:** `DFCACHE\x00` magic (8 bytes) + nonce (12) + ciphertext + HMAC-SHA256
+  tag (32). Constant overhead 52 bytes; plaintext length = on-disk size − 52. Streams in
+  64KB chunks with bounded memory. Magic lets stale files (e.g. legacy raw-format caches on
+  Android devices) be detected → deleted → treated as cache miss (re-downloaded).
 
 `cache.rs` rework:
 
-- `CacheWriter::write` encrypts incrementally (GCM stream API).
+- `CacheWriter::write` encrypts incrementally (AES-CTR keystream + incremental HMAC,
+  64KB chunks, bounded memory); `finish` writes the HMAC tag.
 - `Cache::open` validates magic; returns a decrypting reader (`CacheFile: Read + Send`)
   + **plaintext** length instead of raw `File` + on-disk length. No-magic files →
   deleted + `None`.
