@@ -3,7 +3,7 @@
 
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use egui::ViewportId;
@@ -31,6 +31,20 @@ use crate::ui::{MigratedSource, Screen, initial_screen};
 /// The wgpu backend family the app renders with. GL is used (not Vulkan)
 /// because the Vulkan backend currently has a memory leak in wgpu.
 const GRAPHICS_BACKENDS: wgpu::Backends = wgpu::Backends::GL;
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn shutdown_runtime_bound<T>(
+    resource: &mut Option<T>,
+    runtime: &mut Option<tokio::runtime::Runtime>,
+) {
+    {
+        let _runtime_guard = runtime.as_ref().map(|runtime| runtime.enter());
+        drop(resource.take());
+    }
+    if let Some(runtime) = runtime.take() {
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    }
+}
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -219,6 +233,18 @@ impl App {
     /// ruffle's `tokio::spawn` calls find a reactor.
     fn enter_runtime(&self) -> Option<tokio::runtime::EnterGuard<'_>> {
         self.runtime.as_ref().map(|runtime| runtime.enter())
+    }
+
+    fn shutdown(&mut self) {
+        shutdown_runtime_bound(&mut self.player, &mut self.runtime);
+        drop(self.egui_renderer.take());
+        drop(self.movie_target.take());
+        drop(self.egui_winit.take());
+        drop(self.surface.take());
+        drop(self.descriptors.take());
+        // The surface was created from an unsafe raw window handle, so the
+        // native window must remain alive until after the surface is dropped.
+        drop(self.window.take());
     }
 
     fn start_game(&mut self) {
@@ -817,6 +843,10 @@ impl ApplicationHandler<RuffleEvent> for App {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.shutdown();
+    }
 }
 
 // Pure egui widgets for the overlay screens. (These live in app.rs for now;
@@ -928,7 +958,34 @@ fn loading_ui(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+
+    struct RuntimeDropProbe(Arc<AtomicBool>);
+
+    impl Drop for RuntimeDropProbe {
+        fn drop(&mut self) {
+            self.0.store(
+                tokio::runtime::Handle::try_current().is_ok(),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_bound_resource_drops_inside_runtime_context() {
+        let dropped_inside_runtime = Arc::new(AtomicBool::new(false));
+        let mut resource = Some(RuntimeDropProbe(dropped_inside_runtime.clone()));
+        let mut runtime = Some(tokio::runtime::Runtime::new().unwrap());
+
+        shutdown_runtime_bound(&mut resource, &mut runtime);
+        shutdown_runtime_bound(&mut resource, &mut runtime);
+
+        assert!(dropped_inside_runtime.load(Ordering::Relaxed));
+        assert!(resource.is_none());
+        assert!(runtime.is_none());
+    }
 
     fn error_screen() -> (egui::Context, Option<ErrorAction>, Vec<(ErrorAction, egui::Rect)>) {
         let ctx = egui::Context::default();
