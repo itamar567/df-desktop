@@ -21,6 +21,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, Modifiers, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::config::{self, State};
@@ -34,8 +35,9 @@ use crate::ui::{MigratedSource, Screen, initial_screen};
 const GRAPHICS_BACKENDS: wgpu::Backends = wgpu::Backends::GL;
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const APP_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(0x66, 0x00, 0x00);
-const MENU_BAR_HEIGHT: f32 = 28.0;
 const LAUNCHER_BUTTON_SIZE: egui::Vec2 = egui::vec2(240.0, 42.0);
+const TOAST_DURATION: Duration = Duration::from_secs(3);
+const TOAST_FADE_DURATION: Duration = Duration::from_millis(450);
 
 fn shutdown_runtime_bound<T>(
     resource: &mut Option<T>,
@@ -80,7 +82,11 @@ pub struct App {
     time: Instant,
     last_pointer: PhysicalPosition<f64>,
     modifiers: Modifiers,
-    cache_notice: Option<(String, Instant)>,
+    launcher_open: bool,
+    launcher_hit_regions: LauncherHitRegions,
+    launcher_pointer_over: bool,
+    launcher_pointer_captured: bool,
+    toast: Option<Toast>,
     /// Tokio runtime whose context must be entered whenever ruffle futures are
     /// polled or player methods may touch the navigator (ruffle's backend uses
     /// `tokio::spawn` directly, which panics without an entered runtime).
@@ -230,7 +236,11 @@ impl App {
             time: Instant::now(),
             last_pointer: PhysicalPosition::new(0.0, 0.0),
             modifiers: Modifiers::default(),
-            cache_notice: None,
+            launcher_open: false,
+            launcher_hit_regions: LauncherHitRegions::default(),
+            launcher_pointer_over: false,
+            launcher_pointer_captured: false,
+            toast: None,
             runtime: Some(runtime),
         };
         if matches!(app.screen, Screen::Playing) {
@@ -298,13 +308,22 @@ impl App {
             .window
             .as_ref()
             .is_some_and(|window| window.fullscreen().is_some());
+        let entering_fullscreen = !fullscreen;
         if let Some(player) = &self.player {
             let mut player = player.lock().unwrap();
-            player.set_fullscreen(!fullscreen);
+            player.set_fullscreen(entering_fullscreen);
         } else if let Some(window) = &self.window {
             use winit::window::Fullscreen;
-            window.set_fullscreen((!fullscreen).then(|| Fullscreen::Borderless(None)));
+            window.set_fullscreen(
+                entering_fullscreen.then(|| Fullscreen::Borderless(None)),
+            );
         }
+        self.launcher_open = false;
+        self.show_toast(if entering_fullscreen {
+            "Fullscreen — press F11 to exit"
+        } else {
+            "Exited fullscreen"
+        });
     }
 
     fn clear_game_cache(&mut self) {
@@ -314,24 +333,71 @@ impl App {
             dragonfable_cache::clear_cache_dir(&config::cache_dir())
         };
         let message = match result {
-            Ok(()) => "Cache cleared".to_string(),
+            Ok(()) => "Cache cleared — save data was preserved".to_string(),
             Err(error) => {
                 tracing::warn!("Could not clear cache: {error}");
                 format!("Could not clear cache: {error}")
             }
         };
-        self.cache_notice = Some((message, Instant::now()));
+        self.show_toast(message);
     }
 
-    fn apply_menu_action(&mut self, action: AppMenuAction) {
+    fn show_toast(&mut self, message: impl Into<String>) {
+        self.toast = Some(Toast {
+            message: message.into(),
+            shown_at: Instant::now(),
+        });
+    }
+
+    fn apply_launcher_action(&mut self, action: LauncherAction) {
         match action {
-            AppMenuAction::ToggleFullscreen => self.toggle_fullscreen(),
-            AppMenuAction::ClearCache => self.clear_game_cache(),
+            LauncherAction::ToggleFullscreen => self.toggle_fullscreen(),
+            LauncherAction::ClearCache => self.clear_game_cache(),
         }
+        self.launcher_open = false;
         self.window
             .as_ref()
             .expect("window exists")
             .request_redraw();
+    }
+
+    fn pointer_is_over_launcher(&self, position: PhysicalPosition<f64>) -> bool {
+        let window = self.window.as_ref().expect("window exists");
+        let logical = position.to_logical::<f64>(window.scale_factor());
+        self.launcher_hit_regions
+            .contains(egui::pos2(logical.x as f32, logical.y as f32))
+    }
+
+    fn launcher_consumes_pointer_event(&mut self, event: &WindowEvent) -> bool {
+        match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                self.last_pointer = *position;
+                self.launcher_pointer_over = self.pointer_is_over_launcher(*position);
+                self.launcher_pointer_over || self.launcher_pointer_captured
+            }
+            WindowEvent::MouseInput { state, .. } => match state {
+                ElementState::Pressed => {
+                    let consumes = self.launcher_open || self.launcher_pointer_over;
+                    self.launcher_pointer_captured = consumes;
+                    consumes
+                }
+                ElementState::Released => {
+                    let consumes = self.launcher_pointer_captured
+                        || self.launcher_open
+                        || self.launcher_pointer_over;
+                    self.launcher_pointer_captured = false;
+                    consumes
+                }
+            },
+            WindowEvent::MouseWheel { .. } => {
+                self.launcher_open || self.launcher_pointer_over
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.launcher_pointer_over = false;
+                self.launcher_pointer_captured
+            }
+            _ => false,
+        }
     }
 
     fn movie_rect(&self) -> egui::Rect {
@@ -341,12 +407,7 @@ impl App {
         // window size or the movie is drawn scale_factor× too large.
         let window = self.window.as_ref().expect("window exists");
         let logical = window.inner_size().to_logical::<f64>(window.scale_factor());
-        let mut rect = movie_rect_for(
-            size,
-            (logical.width, (logical.height - MENU_BAR_HEIGHT as f64).max(1.0)),
-        );
-        rect = rect.translate(egui::vec2(0.0, MENU_BAR_HEIGHT));
-        rect
+        movie_rect_for(size, (logical.width, logical.height))
     }
 
     fn window_to_movie_viewport(&self, pos: PhysicalPosition<f64>) -> (f64, f64) {
@@ -365,14 +426,8 @@ impl App {
         let movie_size = (*self.movie_size.lock().unwrap()).unwrap_or((800, 600));
         let window = self.window.as_ref().expect("window exists");
         let window_size = window.inner_size();
-        let menu_height = (MENU_BAR_HEIGHT * window.scale_factor() as f32).round() as u32;
-        let viewport_size = movie_viewport_size_for(
-            movie_size,
-            (
-                window_size.width,
-                window_size.height.saturating_sub(menu_height).max(1),
-            ),
-        );
+        let viewport_size =
+            movie_viewport_size_for(movie_size, (window_size.width, window_size.height));
         let scale_factor = window.scale_factor();
         let Some(player) = &self.player else {
             return;
@@ -463,24 +518,18 @@ impl App {
             .expect("egui state exists")
             .egui_ctx()
             .clone();
-        let mut menu_action = None;
-        if self
-            .cache_notice
-            .as_ref()
-            .is_some_and(|(_, shown_at)| shown_at.elapsed() >= Duration::from_secs(3))
-        {
-            self.cache_notice = None;
+        let now = Instant::now();
+        if self.toast.as_ref().is_some_and(|toast| toast.expired(now)) {
+            self.toast = None;
         }
         let fullscreen = self
             .window
             .as_ref()
             .is_some_and(|window| window.fullscreen().is_some());
+        let launcher_open = self.launcher_open;
+        let toast = self.toast.clone();
+        let mut launcher_response = LauncherResponse::default();
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            menu_action = application_menu_ui(
-                ctx,
-                fullscreen,
-                self.cache_notice.as_ref().map(|(message, _)| message.as_str()),
-            );
             match &self.screen {
                 Screen::Disclaimer => {
                     if disclaimer_ui(ctx) {
@@ -531,12 +580,32 @@ impl App {
                     } else {
                         loading_ui(ctx);
                     }
+                    launcher_response = launcher_ui(
+                        ctx,
+                        fullscreen,
+                        launcher_open,
+                    );
                 }
+            }
+            if let Some(toast) = &toast {
+                toast_ui(ctx, toast, now);
             }
         });
 
-        if let Some(action) = menu_action {
-            self.apply_menu_action(action);
+        if let Some(open) = launcher_response.set_open {
+            let changed = self.launcher_open != open;
+            self.launcher_open = open;
+            if changed {
+                self.window
+                    .as_ref()
+                    .expect("window exists")
+                    .request_redraw();
+            }
+        }
+        self.launcher_hit_regions = launcher_response.hit_regions;
+        self.launcher_pointer_over = self.pointer_is_over_launcher(self.last_pointer);
+        if let Some(action) = launcher_response.action {
+            self.apply_launcher_action(action);
         }
 
         self.egui_winit
@@ -798,16 +867,27 @@ impl ApplicationHandler<RuffleEvent> for App {
             let _ = egui_winit.on_window_event(window, &event);
         }
 
+        if let WindowEvent::KeyboardInput { event, .. } = &event
+            && matches!(event.logical_key, Key::Named(NamedKey::F11))
+        {
+            if event.state == ElementState::Pressed && !event.repeat {
+                self.toggle_fullscreen();
+            }
+            self.window
+                .as_ref()
+                .expect("window exists")
+                .request_redraw();
+            return;
+        }
+
+        let launcher_consumed = self.launcher_consumes_pointer_event(&event);
+
         match &self.screen {
-            Screen::Playing => {
+            Screen::Playing if !launcher_consumed => {
                 if let Some(player) = &self.player {
                     let mut player_lock = player.lock().unwrap();
                     match &event {
                         WindowEvent::CursorMoved { position, .. } => {
-                            if *position == self.last_pointer {
-                                return;
-                            }
-                            self.last_pointer = *position;
                             let (x, y) = self.window_to_movie_viewport(*position);
                             player_lock.handle_event(PlayerEvent::MouseMove {
                                 x,
@@ -929,19 +1009,16 @@ impl ApplicationHandler<RuffleEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let _runtime_guard = self.enter_runtime();
-        let notice_deadline = self
-            .cache_notice
-            .as_ref()
-            .map(|(_, shown_at)| *shown_at + Duration::from_secs(3));
-        if notice_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
-            self.cache_notice = None;
+        let now = Instant::now();
+        if self.toast.as_ref().is_some_and(|toast| toast.expired(now)) {
+            self.toast = None;
             self.window
                 .as_ref()
                 .expect("window exists")
                 .request_redraw();
         }
         if matches!(self.screen, Screen::Playing) && self.player.is_some() {
-            let new_time = Instant::now();
+            let new_time = now;
             let dt = FloatDuration::from_std(new_time.duration_since(self.time));
             if dt.as_millis() > 0.0 {
                 self.time = new_time;
@@ -961,10 +1038,16 @@ impl ApplicationHandler<RuffleEvent> for App {
             {
                 self.window.as_ref().expect("window exists").request_redraw();
             }
-        } else if let Some(deadline) = notice_deadline {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
+        }
+
+        if self.toast.is_some() {
+            self.window
+                .as_ref()
+                .expect("window exists")
+                .request_redraw();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(16)));
         }
     }
 
@@ -973,10 +1056,241 @@ impl ApplicationHandler<RuffleEvent> for App {
     }
 }
 
+#[derive(Debug, Clone)]
+struct Toast {
+    message: String,
+    shown_at: Instant,
+}
+
+impl Toast {
+    fn expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.shown_at) >= TOAST_DURATION
+    }
+
+    fn opacity(&self, now: Instant) -> f32 {
+        let elapsed = now.saturating_duration_since(self.shown_at);
+        let fade_start = TOAST_DURATION.saturating_sub(TOAST_FADE_DURATION);
+        if elapsed <= fade_start {
+            1.0
+        } else {
+            1.0 - (elapsed - fade_start).as_secs_f32() / TOAST_FADE_DURATION.as_secs_f32()
+        }
+        .clamp(0.0, 1.0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppMenuAction {
+enum LauncherAction {
     ToggleFullscreen,
     ClearCache,
+}
+
+#[derive(Debug, Default)]
+struct LauncherResponse {
+    action: Option<LauncherAction>,
+    set_open: Option<bool>,
+    hit_regions: LauncherHitRegions,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct LauncherHitRegions {
+    trigger: Option<egui::Rect>,
+    popover: Option<egui::Rect>,
+}
+
+impl LauncherHitRegions {
+    fn contains(self, position: egui::Pos2) -> bool {
+        self.trigger.is_some_and(|rect| rect.contains(position))
+            || self.popover.is_some_and(|rect| rect.contains(position))
+    }
+}
+
+fn launcher_trigger(ui: &mut egui::Ui) -> egui::Response {
+    use egui::{Color32, CornerRadius, Sense, Stroke, StrokeKind};
+
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(34.0, 32.0), Sense::click());
+    let fill = if response.hovered() {
+        Color32::from_rgb(0x86, 0x18, 0x18)
+    } else {
+        Color32::from_rgb(0x2B, 0x06, 0x06)
+    };
+    let bronze = Color32::from_rgb(0xC0, 0x8A, 0x47);
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(6),
+        fill,
+        Stroke::new(1.0_f32, bronze),
+        StrokeKind::Inside,
+    );
+    for offset in [-6.0_f32, 0.0, 6.0] {
+        ui.painter().circle_filled(
+            egui::pos2(rect.center().x + offset, rect.center().y),
+            1.7,
+            bronze,
+        );
+    }
+    response.on_hover_text("Launcher controls")
+}
+
+fn launcher_menu_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    shortcut: Option<&str>,
+) -> egui::Response {
+    use egui::{Align2, Color32, CornerRadius, FontId, Sense, Stroke, StrokeKind};
+
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(196.0, 32.0), Sense::click());
+    let fill = if response.is_pointer_button_down_on() {
+        Color32::from_rgb(0x8E, 0x1D, 0x1D)
+    } else if response.hovered() {
+        Color32::from_rgb(0x76, 0x14, 0x14)
+    } else {
+        Color32::from_rgb(0x4A, 0x0B, 0x0B)
+    };
+    let border = if response.hovered() {
+        Color32::from_rgb(0xD7, 0xAA, 0x69)
+    } else {
+        Color32::from_rgb(0x8D, 0x5E, 0x2F)
+    };
+
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(5),
+        fill,
+        Stroke::new(1.0_f32, border),
+        StrokeKind::Inside,
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 12.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(15.0),
+        Color32::from_rgb(0xFF, 0xF0, 0xD0),
+    );
+    if let Some(shortcut) = shortcut {
+        ui.painter().text(
+            egui::pos2(rect.right() - 12.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            shortcut,
+            FontId::proportional(12.0),
+            Color32::from_rgb(0xD7, 0xAA, 0x69),
+        );
+    }
+
+    response
+}
+
+fn launcher_ui(
+    ctx: &egui::Context,
+    fullscreen: bool,
+    open: bool,
+) -> LauncherResponse {
+    use egui::{Align2, Color32, CornerRadius, Frame, Margin, Order, Stroke};
+
+    let mut output = LauncherResponse::default();
+
+    let trigger = egui::Area::new(egui::Id::new("launcher_trigger"))
+        .anchor(Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+        .order(Order::Foreground)
+        .show(ctx, launcher_trigger);
+    output.hit_regions.trigger = Some(trigger.response.rect);
+    if trigger.inner.clicked() {
+        output.set_open = Some(!open);
+    }
+
+    let mut popover_rect = None;
+    if open {
+        let popover = egui::Area::new(egui::Id::new("launcher_popover"))
+            .anchor(Align2::RIGHT_TOP, egui::vec2(-12.0, 50.0))
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(0x2B, 0x06, 0x06, 245))
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        Color32::from_rgb(0xC0, 0x8A, 0x47),
+                    ))
+                    .corner_radius(CornerRadius::same(7))
+                    .inner_margin(Margin::symmetric(8, 8))
+                    .show(ui, |ui| {
+                        ui.set_min_width(196.0);
+                        let fullscreen_text = if fullscreen {
+                            "Exit fullscreen"
+                        } else {
+                            "Fullscreen"
+                        };
+                        if launcher_menu_button(ui, fullscreen_text, Some("F11")).clicked() {
+                            return Some(LauncherAction::ToggleFullscreen);
+                        }
+                        ui.add_space(5.0);
+                        if launcher_menu_button(ui, "Clear cache", None).clicked() {
+                            return Some(LauncherAction::ClearCache);
+                        }
+                        None
+                    })
+                    .inner
+            });
+        popover_rect = Some(popover.response.rect);
+        output.hit_regions.popover = popover_rect;
+        if let Some(action) = popover.inner {
+            output.action = Some(action);
+            output.set_open = Some(false);
+        }
+    }
+
+    if open && ctx.input(|input| input.pointer.any_pressed()) {
+        let outside = ctx.input(|input| input.pointer.interact_pos()).is_some_and(|position| {
+            !trigger.response.rect.contains(position)
+                && popover_rect.is_none_or(|rect| !rect.contains(position))
+        });
+        if outside {
+            output.set_open = Some(false);
+        }
+    }
+
+    output
+}
+
+fn toast_ui(ctx: &egui::Context, toast: &Toast, now: Instant) {
+    use egui::{Align2, Color32, CornerRadius, FontId, Frame, Margin, Order, Stroke};
+
+    let opacity = toast.opacity(now);
+    let text_color =
+        Color32::from_rgb(0xF4, 0xE8, 0xD0).gamma_multiply(opacity);
+    let font_id = FontId::proportional(15.0);
+    egui::Area::new(egui::Id::new("launcher_toast"))
+        .anchor(Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
+        .order(Order::Tooltip)
+        .interactable(false)
+        .show(ctx, |ui| {
+            let text_width = ui
+                .painter()
+                .layout_no_wrap(toast.message.clone(), font_id.clone(), text_color)
+                .size()
+                .x;
+            Frame::new()
+                .fill(
+                    Color32::from_rgba_unmultiplied(0x2B, 0x06, 0x06, 235)
+                        .gamma_multiply(opacity),
+                )
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    Color32::from_rgb(0xC0, 0x8A, 0x47).gamma_multiply(opacity),
+                ))
+                .corner_radius(CornerRadius::same(7))
+                .inner_margin(Margin::symmetric(14, 9))
+                .show(ui, |ui| {
+                    ui.set_width(text_width.ceil() + 1.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&toast.message)
+                                .color(text_color)
+                                .font(font_id),
+                        )
+                        .extend(),
+                    );
+                });
+        });
 }
 
 fn configure_style(ctx: &egui::Context) {
@@ -1018,41 +1332,6 @@ fn configure_style(ctx: &egui::Context) {
     style.text_styles.insert(TextStyle::Body, FontId::proportional(16.0));
     style.text_styles.insert(TextStyle::Button, FontId::proportional(16.0));
     ctx.set_style(style);
-}
-
-fn application_menu_ui(
-    ctx: &egui::Context,
-    fullscreen: bool,
-    notice: Option<&str>,
-) -> Option<AppMenuAction> {
-    let mut action = None;
-    egui::TopBottomPanel::top("application_menu")
-        .exact_height(MENU_BAR_HEIGHT)
-        .frame(egui::Frame::NONE.fill(APP_BACKGROUND))
-        .show(ctx, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("Application", |ui| {
-                    let fullscreen_label = if fullscreen {
-                        "Exit fullscreen"
-                    } else {
-                        "Enter fullscreen"
-                    };
-                    if ui.button(fullscreen_label).clicked() {
-                        action = Some(AppMenuAction::ToggleFullscreen);
-                        ui.close();
-                    }
-                    if ui.button("Clear cache").clicked() {
-                        action = Some(AppMenuAction::ClearCache);
-                        ui.close();
-                    }
-                });
-                if let Some(notice) = notice {
-                    ui.separator();
-                    ui.label(notice);
-                }
-            });
-        });
-    action
 }
 
 fn launcher_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
@@ -1455,6 +1734,33 @@ mod tests {
         let (x, _) =
             window_to_movie_viewport_for(PhysicalPosition::new(240.0, 0.0), &rect, 1.5);
         assert!(x.abs() < 1e-3);
+    }
+
+    #[test]
+    fn launcher_hit_regions_only_capture_the_launcher() {
+        let regions = LauncherHitRegions {
+            trigger: Some(egui::Rect::from_min_max(
+                egui::pos2(90.0, 10.0),
+                egui::pos2(120.0, 40.0),
+            )),
+            popover: Some(egui::Rect::from_min_max(
+                egui::pos2(20.0, 50.0),
+                egui::pos2(120.0, 150.0),
+            )),
+        };
+        assert!(regions.contains(egui::pos2(100.0, 20.0)));
+        assert!(regions.contains(egui::pos2(60.0, 100.0)));
+        assert!(!regions.contains(egui::pos2(10.0, 10.0)));
+    }
+
+    #[test]
+    fn toast_stays_visible_then_fades_and_expires() {
+        let now = Instant::now();
+        let toast = Toast { message: "Done".into(), shown_at: now };
+        assert_eq!(toast.opacity(now), 1.0);
+        let fading = now + TOAST_DURATION - Duration::from_millis(100);
+        assert!(toast.opacity(fading) > 0.0 && toast.opacity(fading) < 1.0);
+        assert!(toast.expired(now + TOAST_DURATION));
     }
 
     #[test]
