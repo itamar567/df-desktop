@@ -17,7 +17,7 @@ use ruffle_render_wgpu::backend::{
 use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::target::TextureTarget;
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalPosition, PhysicalPosition, PhysicalSize};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, Modifiers, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
@@ -63,11 +63,13 @@ pub struct App {
     // player state
     player: Option<Arc<Mutex<Player>>>,
     movie_size: Arc<Mutex<Option<(u32, u32)>>>,
-    /// The GPU texture the player renders into, at the movie's native size.
+    /// The GPU texture the player renders into, sized to the movie's current
+    /// on-screen area in physical pixels.
     /// The renderer owns the authoritative target; this mirrors it so the app
-    /// can detect when the movie size changes and re-register the egui texture.
+    /// can detect viewport changes and re-register the egui texture.
     movie_target: Option<TextureTarget>,
     movie_texture_id: Option<egui::TextureId>,
+    movie_viewport_scale_factor: Option<f64>,
     root_error: Arc<Mutex<Option<String>>>,
     font_database: Rc<fontdb::Database>,
     time: Instant,
@@ -214,6 +216,7 @@ impl App {
             movie_size,
             movie_target: None,
             movie_texture_id: None,
+            movie_viewport_scale_factor: None,
             root_error,
             font_database,
             time: Instant::now(),
@@ -290,21 +293,27 @@ impl App {
         movie_rect_for(size, (logical.width, logical.height))
     }
 
-    fn window_to_movie(&self, pos: PhysicalPosition<f64>) -> (f64, f64) {
-        // Pointer events arrive in physical pixels but the movie rect is in
-        // logical points, so convert before mapping.
+    fn window_to_movie_viewport(&self, pos: PhysicalPosition<f64>) -> (f64, f64) {
+        // Ruffle expects input in physical viewport pixels. The movie rect is
+        // in logical points, so only its offset needs converting here.
         let window = self.window.as_ref().expect("window exists");
-        let logical = pos.to_logical::<f64>(window.scale_factor());
         let rect = self.movie_rect();
-        let size = (*self.movie_size.lock().unwrap()).unwrap_or((800, 600));
-        window_to_movie_for(logical, &rect, size)
+        window_to_movie_viewport_for(pos, &rect, window.scale_factor())
     }
 
     /// Keeps the renderer's viewport + the presented egui texture in sync with
-    /// the movie's size (the placeholder `(800, 600)` until the SWF header
-    /// arrives). Called once per frame before the egui pass.
+    /// the movie's physical on-screen size. Called once per frame before the
+    /// egui pass so window resizes also resize Ruffle's render target instead
+    /// of stretching a texture that remains at the SWF's native resolution.
     fn update_movie_viewport(&mut self) {
-        let size = (*self.movie_size.lock().unwrap()).unwrap_or((800, 600));
+        let movie_size = (*self.movie_size.lock().unwrap()).unwrap_or((800, 600));
+        let window = self.window.as_ref().expect("window exists");
+        let window_size = window.inner_size();
+        let viewport_size = movie_viewport_size_for(
+            movie_size,
+            (window_size.width, window_size.height),
+        );
+        let scale_factor = window.scale_factor();
         let Some(player) = &self.player else {
             return;
         };
@@ -313,15 +322,17 @@ impl App {
             self.movie_target
                 .as_ref()
                 .map(|target| (target.size.width, target.size.height)),
-            size,
+            self.movie_viewport_scale_factor,
+            viewport_size,
+            scale_factor,
         ) {
             return;
         }
         let mut player_lock = player.lock().unwrap();
         player_lock.set_viewport_dimensions(ViewportDimensions {
-            width: size.0,
-            height: size.1,
-            scale_factor: 1.0,
+            width: viewport_size.0,
+            height: viewport_size.1,
+            scale_factor,
         });
         let live = <dyn std::any::Any>::downcast_ref::<WgpuRenderBackend<TextureTarget>>(
             player_lock.renderer(),
@@ -338,6 +349,7 @@ impl App {
             format: live.format,
             buffer: None,
         });
+        self.movie_viewport_scale_factor = Some(scale_factor);
     }
 
     fn render(&mut self, event_loop: &ActiveEventLoop) {
@@ -606,13 +618,17 @@ impl App {
 /// True when the presented movie viewport must be re-synced: either no egui
 /// texture has been registered yet (the SWF header may report a stage size
 /// equal to the placeholder, so a size mismatch alone would miss it) or the
-/// movie size differs from the currently presented one.
+/// physical size/scale factor differs from the currently presented one.
 fn viewport_needs_update(
     movie_texture_id: Option<egui::TextureId>,
     movie_target_size: Option<(u32, u32)>,
+    current_scale_factor: Option<f64>,
     size: (u32, u32),
+    scale_factor: f64,
 ) -> bool {
-    movie_texture_id.is_none() || movie_target_size.is_none_or(|target| target != size)
+    movie_texture_id.is_none()
+        || movie_target_size.is_none_or(|target| target != size)
+        || current_scale_factor != Some(scale_factor)
 }
 
 /// (Re)registers the renderer's target texture with egui, freeing the previous
@@ -648,16 +664,25 @@ fn movie_rect_for(movie: (u32, u32), window: (f64, f64)) -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2((ww - w) / 2.0, (wh - h) / 2.0), egui::vec2(w, h))
 }
 
-/// Maps a logical-point position (the physical pointer divided by the window's
-/// scale factor) into movie coordinates inside `rect`.
-fn window_to_movie_for(
-    pos: LogicalPosition<f64>,
+/// Returns the physical-pixel render resolution for an aspect-fitted movie.
+fn movie_viewport_size_for(movie: (u32, u32), window: (u32, u32)) -> (u32, u32) {
+    let rect = movie_rect_for(movie, (window.0 as f64, window.1 as f64));
+    (
+        (rect.width().round() as u32).max(1),
+        (rect.height().round() as u32).max(1),
+    )
+}
+
+/// Maps a physical pointer position into Ruffle's physical-pixel viewport.
+fn window_to_movie_viewport_for(
+    pos: PhysicalPosition<f64>,
     rect: &egui::Rect,
-    movie: (u32, u32),
+    scale_factor: f64,
 ) -> (f64, f64) {
-    let x = (pos.x as f32 - rect.min.x) * movie.0.max(1) as f32 / rect.width();
-    let y = (pos.y as f32 - rect.min.y) * movie.1.max(1) as f32 / rect.height();
-    (x as f64, y as f64)
+    (
+        pos.x - f64::from(rect.min.x) * scale_factor,
+        pos.y - f64::from(rect.min.y) * scale_factor,
+    )
 }
 
 impl ApplicationHandler<RuffleEvent> for App {
@@ -697,7 +722,7 @@ impl ApplicationHandler<RuffleEvent> for App {
                                 return;
                             }
                             self.last_pointer = *position;
-                            let (x, y) = self.window_to_movie(*position);
+                            let (x, y) = self.window_to_movie_viewport(*position);
                             player_lock.handle_event(PlayerEvent::MouseMove {
                                 x,
                                 y,
@@ -705,7 +730,7 @@ impl ApplicationHandler<RuffleEvent> for App {
                             });
                         }
                         WindowEvent::MouseInput { button, state, .. } => {
-                            let (x, y) = self.window_to_movie(self.last_pointer);
+                            let (x, y) = self.window_to_movie_viewport(self.last_pointer);
                             let button = match button {
                                 winit::event::MouseButton::Left => MouseButton::Left,
                                 winit::event::MouseButton::Right => MouseButton::Right,
@@ -1096,8 +1121,20 @@ mod tests {
 
     #[test]
     fn viewport_needs_update_when_no_texture_registered_even_if_sizes_match() {
-        assert!(viewport_needs_update(None, Some((800, 600)), (800, 600)));
-        assert!(viewport_needs_update(None, None, (800, 600)));
+        assert!(viewport_needs_update(
+            None,
+            Some((800, 600)),
+            Some(1.0),
+            (800, 600),
+            1.0
+        ));
+        assert!(viewport_needs_update(
+            None,
+            None,
+            None,
+            (800, 600),
+            1.0
+        ));
     }
 
     #[test]
@@ -1105,7 +1142,20 @@ mod tests {
         assert!(viewport_needs_update(
             Some(egui::TextureId::User(1)),
             Some((800, 600)),
-            (750, 550)
+            Some(1.0),
+            (750, 550),
+            1.0
+        ));
+    }
+
+    #[test]
+    fn viewport_needs_update_when_the_scale_factor_changed() {
+        assert!(viewport_needs_update(
+            Some(egui::TextureId::User(1)),
+            Some((800, 600)),
+            Some(1.0),
+            (800, 600),
+            1.5
         ));
     }
 
@@ -1114,7 +1164,9 @@ mod tests {
         assert!(!viewport_needs_update(
             Some(egui::TextureId::User(1)),
             Some((800, 600)),
-            (800, 600)
+            Some(1.5),
+            (800, 600),
+            1.5
         ));
     }
 
@@ -1164,34 +1216,44 @@ mod tests {
     }
 
     #[test]
-    fn window_to_movie_maps_into_the_letterboxed_rect() {
+    fn movie_viewport_resolution_tracks_the_aspect_fitted_window_size() {
+        assert_eq!(movie_viewport_size_for((800, 600), (1600, 1200)), (1600, 1200));
+        assert_eq!(movie_viewport_size_for((800, 600), (1600, 600)), (800, 600));
+        assert_eq!(movie_viewport_size_for((800, 600), (800, 300)), (400, 300));
+        assert_eq!(movie_viewport_size_for((0, 0), (0, 0)), (1, 1));
+    }
+
+    #[test]
+    fn window_to_movie_viewport_maps_into_the_letterboxed_rect() {
         let rect = movie_rect_for((800, 600), (1600.0, 600.0));
-        // Center of the window == center of the movie.
-        let (x, y) = window_to_movie_for(LogicalPosition::new(800.0, 300.0), &rect, (800, 600));
+        // Center of the window == center of the 800x600 physical viewport.
+        let (x, y) =
+            window_to_movie_viewport_for(PhysicalPosition::new(800.0, 300.0), &rect, 1.0);
         assert!((x - 400.0).abs() < 1e-3);
         assert!((y - 300.0).abs() < 1e-3);
-        // Left edge of the movie rect == movie x 0.
-        let (x, _) = window_to_movie_for(LogicalPosition::new(400.0, 0.0), &rect, (800, 600));
+        // Left edge of the movie rect == viewport x 0.
+        let (x, _) =
+            window_to_movie_viewport_for(PhysicalPosition::new(400.0, 0.0), &rect, 1.0);
         assert!(x.abs() < 1e-3);
         // Outside the movie rect maps to negative coordinates.
-        let (x, _) = window_to_movie_for(LogicalPosition::new(0.0, 0.0), &rect, (800, 600));
+        let (x, _) =
+            window_to_movie_viewport_for(PhysicalPosition::new(0.0, 0.0), &rect, 1.0);
         assert!(x < 0.0);
     }
 
     #[test]
-    fn window_to_movie_maps_physical_pointer_through_logical_space() {
+    fn window_to_movie_viewport_preserves_physical_pixels_on_hidpi() {
         // 1920x1080 physical @ scale 1.5 -> 1280x720 logical points; the
-        // movie rect is (160, 0)..(1120, 720).
+        // movie rect is (160, 0)..(1120, 720), or 1440x1080 physical pixels.
         let rect = movie_rect_for((800, 600), (1280.0, 720.0));
-        // Physical center (960, 540) -> logical (640, 360): the movie center.
-        let logical = PhysicalPosition::new(960.0, 540.0).to_logical::<f64>(1.5);
-        let (x, y) = window_to_movie_for(logical, &rect, (800, 600));
-        assert!((x - 400.0).abs() < 1e-3);
-        assert!((y - 300.0).abs() < 1e-3);
-        // Physical (240, 0) -> logical (160, 0): the movie rect's left edge,
-        // i.e. movie x = 0.
-        let logical = PhysicalPosition::new(240.0, 0.0).to_logical::<f64>(1.5);
-        let (x, _) = window_to_movie_for(logical, &rect, (800, 600));
+        // Physical center maps to the center of that physical viewport.
+        let (x, y) =
+            window_to_movie_viewport_for(PhysicalPosition::new(960.0, 540.0), &rect, 1.5);
+        assert!((x - 720.0).abs() < 1e-3);
+        assert!((y - 540.0).abs() < 1e-3);
+        // Physical (240, 0) is the movie rect's left edge.
+        let (x, _) =
+            window_to_movie_viewport_for(PhysicalPosition::new(240.0, 0.0), &rect, 1.5);
         assert!(x.abs() < 1e-3);
     }
 
@@ -1204,4 +1266,3 @@ mod tests {
         )))));
     }
 }
-
