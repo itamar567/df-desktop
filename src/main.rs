@@ -8,17 +8,45 @@ mod navigator;
 mod player;
 mod ui;
 
+use std::panic::Location;
+
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 use winit::event_loop::EventLoop;
 
 fn main() -> anyhow::Result<()> {
     init_logging();
+    install_panic_hook();
 
     let event_loop = EventLoop::<crate::player::RuffleEvent>::with_user_event().build()?;
     let mut app = app::App::new(&event_loop)?;
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// Logs panics to the file log (and stderr, via the default hook) so a crash
+/// leaves evidence even when the process aborts. Installed after logging is up.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        tracing::error!("{}", format_panic(info.payload_as_str(), info.location()));
+    }));
+}
+
+/// Formats a panic for the file log: the payload message plus the panic site.
+/// Kept separate from the hook so tests can drive it without panicking.
+fn format_panic(payload: Option<&str>, location: Option<&Location<'_>>) -> String {
+    let mut message = format!("PANIC: {}", payload.unwrap_or("panic occurred"));
+    if let Some(location) = location {
+        message.push_str(&format!(
+            "\n  at {}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        ));
+    }
+    message
 }
 
 fn init_logging() {
@@ -39,4 +67,22 @@ fn init_logging() {
     // the queue on drop); leaking it keeps the log writer alive for the whole
     // program, which is essential on Windows where there is no console.
     std::mem::forget(guard);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_panic_includes_message_and_location() {
+        let formatted = format_panic(Some("boom"), Some(Location::caller()));
+        assert!(formatted.starts_with("PANIC: boom"));
+        assert!(formatted.contains("at src/main.rs:"), "got: {formatted}");
+    }
+
+    #[test]
+    fn format_panic_falls_back_without_payload_or_location() {
+        let formatted = format_panic(None, None);
+        assert_eq!(formatted, "PANIC: panic occurred");
+    }
 }
