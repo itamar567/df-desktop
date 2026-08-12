@@ -270,9 +270,13 @@ impl App {
         let Some(player) = &self.player else {
             return;
         };
-        if self.movie_target.as_ref().is_some_and(|target| {
-            target.size.width == size.0 && target.size.height == size.1
-        }) {
+        if !viewport_needs_update(
+            self.movie_texture_id,
+            self.movie_target
+                .as_ref()
+                .map(|target| (target.size.width, target.size.height)),
+            size,
+        ) {
             return;
         }
         let mut player_lock = player.lock().unwrap();
@@ -298,7 +302,7 @@ impl App {
         });
     }
 
-    fn render(&mut self) {
+    fn render(&mut self, event_loop: &ActiveEventLoop) {
         let _runtime_guard = self.enter_runtime();
         self.update_movie_viewport();
 
@@ -364,8 +368,10 @@ impl App {
                     }
                 }
                 Screen::Error { message } => {
-                    if error_ui(ctx, message, self.player.is_some()) {
-                        self.retry_play();
+                    match error_ui(ctx, message, self.player.is_some()) {
+                        Some(ErrorAction::Retry) => self.retry_play(),
+                        Some(ErrorAction::Quit) => event_loop.exit(),
+                        None => {}
                     }
                 }
                 Screen::Playing => {
@@ -391,7 +397,6 @@ impl App {
                                             .fit_to_exact_size(rect.size()),
                                         );
                                     });
-                                ctx.request_repaint();
                             });
                     } else {
                         loading_ui(ctx);
@@ -542,6 +547,18 @@ impl App {
     }
 }
 
+/// True when the presented movie viewport must be re-synced: either no egui
+/// texture has been registered yet (the SWF header may report a stage size
+/// equal to the placeholder, so a size mismatch alone would miss it) or the
+/// movie size differs from the currently presented one.
+fn viewport_needs_update(
+    movie_texture_id: Option<egui::TextureId>,
+    movie_target_size: Option<(u32, u32)>,
+    size: (u32, u32),
+) -> bool {
+    movie_texture_id.is_none() || movie_target_size.is_none_or(|target| target != size)
+}
+
 /// (Re)registers the renderer's target texture with egui, freeing the previous
 /// registration. The view is recreated every call because the target texture is
 /// replaced whenever the renderer's viewport is resized.
@@ -594,7 +611,7 @@ impl ApplicationHandler<RuffleEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let _runtime_guard = self.enter_runtime();
         if let WindowEvent::RedrawRequested = &event {
-            self.render();
+            self.render(event_loop);
             return;
         }
 
@@ -658,7 +675,11 @@ impl ApplicationHandler<RuffleEvent> for App {
                             };
                             player_lock.handle_event(PlayerEvent::MouseWheel { delta });
                         }
+                        WindowEvent::CursorEntered { .. } => {
+                            player_lock.set_mouse_in_stage(true);
+                        }
                         WindowEvent::CursorLeft { .. } => {
+                            player_lock.set_mouse_in_stage(false);
                             player_lock.handle_event(PlayerEvent::MouseLeave);
                         }
                         WindowEvent::Focused(focused) => {
@@ -808,8 +829,26 @@ fn setup_ui(ctx: &egui::Context, sources: &[MigratedSource]) -> Option<Option<us
     choice
 }
 
-fn error_ui(ctx: &egui::Context, message: &str, can_retry: bool) -> bool {
-    let mut retry = false;
+/// The action the user picked on the error screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorAction {
+    Retry,
+    Quit,
+}
+
+fn error_ui(ctx: &egui::Context, message: &str, can_retry: bool) -> Option<ErrorAction> {
+    error_ui_with_geometry(ctx, message, can_retry).0
+}
+
+/// [`error_ui`] plus the button rects, so tests can drive clicks without
+/// guessing layout metrics.
+fn error_ui_with_geometry(
+    ctx: &egui::Context,
+    message: &str,
+    can_retry: bool,
+) -> (Option<ErrorAction>, Vec<(ErrorAction, egui::Rect)>) {
+    let mut action = None;
+    let mut buttons = Vec::new();
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(0x66, 0x00, 0x00)))
         .show(ctx, |ui| {
@@ -819,12 +858,22 @@ fn error_ui(ctx: &egui::Context, message: &str, can_retry: bool) -> bool {
                 ui.add_space(16.0);
                 ui.label(message);
                 ui.add_space(24.0);
-                if can_retry && ui.button("Retry").clicked() {
-                    retry = true;
+                if can_retry {
+                    let response = ui.button("Retry");
+                    if response.clicked() {
+                        action = Some(ErrorAction::Retry);
+                    }
+                    buttons.push((ErrorAction::Retry, response.rect));
+                    ui.add_space(8.0);
                 }
+                let response = ui.button("Quit");
+                if response.clicked() {
+                    action = Some(ErrorAction::Quit);
+                }
+                buttons.push((ErrorAction::Quit, response.rect));
             });
         });
-    retry
+    (action, buttons)
 }
 
 fn loading_ui(ctx: &egui::Context) {
@@ -841,6 +890,137 @@ fn loading_ui(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn error_screen() -> (egui::Context, Option<ErrorAction>, Vec<(ErrorAction, egui::Rect)>) {
+        let ctx = egui::Context::default();
+        let mut result = (None, Vec::new());
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| result = error_ui_with_geometry(ctx, "boom", true),
+        );
+        (ctx, result.0, result.1)
+    }
+
+    fn error_ui_clicked_at(pos: egui::Pos2, can_retry: bool) -> Option<ErrorAction> {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        // First pass lays out the widgets; the click in the second pass is
+        // hit-tested against the rects registered by this pass.
+        let _ = ctx.run(input(), |ctx| {
+            error_ui_with_geometry(ctx, "boom", can_retry);
+        });
+        let mut action = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..input()
+            },
+            |ctx| action = error_ui_with_geometry(ctx, "boom", can_retry).0,
+        );
+        action
+    }
+
+    #[test]
+    fn error_ui_without_a_click_returns_no_action() {
+        let (_, action, _) = error_screen();
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn error_ui_retry_click_returns_retry() {
+        let (_, _, buttons) = error_screen();
+        let rect = buttons
+            .iter()
+            .find(|(action, _)| matches!(action, ErrorAction::Retry))
+            .expect("Retry button")
+            .1;
+        assert_eq!(error_ui_clicked_at(rect.center(), true), Some(ErrorAction::Retry));
+    }
+
+    #[test]
+    fn error_ui_quit_click_returns_quit() {
+        let (_, _, buttons) = error_screen();
+        let rect = buttons
+            .iter()
+            .find(|(action, _)| matches!(action, ErrorAction::Quit))
+            .expect("Quit button")
+            .1;
+        assert_eq!(error_ui_clicked_at(rect.center(), true), Some(ErrorAction::Quit));
+    }
+
+    #[test]
+    fn error_ui_without_retry_offers_only_quit() {
+        let ctx = egui::Context::default();
+        let mut result = (None, Vec::new());
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| result = error_ui_with_geometry(ctx, "boom", false),
+        );
+        assert_eq!(result.0, None);
+        assert_eq!(result.1.len(), 1);
+        assert!(matches!(result.1[0].0, ErrorAction::Quit));
+    }
+
+    #[test]
+    fn error_ui_ignores_clicks_off_the_buttons() {
+        assert_eq!(error_ui_clicked_at(egui::Pos2::new(5.0, 5.0), true), None);
+    }
+
+    #[test]
+    fn viewport_needs_update_when_no_texture_registered_even_if_sizes_match() {
+        assert!(viewport_needs_update(None, Some((800, 600)), (800, 600)));
+        assert!(viewport_needs_update(None, None, (800, 600)));
+    }
+
+    #[test]
+    fn viewport_needs_update_when_the_movie_size_changed() {
+        assert!(viewport_needs_update(
+            Some(egui::TextureId::User(1)),
+            Some((800, 600)),
+            (750, 550)
+        ));
+    }
+
+    #[test]
+    fn viewport_does_not_need_update_when_texture_registered_and_sizes_match() {
+        assert!(!viewport_needs_update(
+            Some(egui::TextureId::User(1)),
+            Some((800, 600)),
+            (800, 600)
+        ));
+    }
 
     #[test]
     fn movie_rect_fills_window_when_aspects_match() {
@@ -889,3 +1069,4 @@ mod tests {
         assert!(x < 0.0);
     }
 }
+

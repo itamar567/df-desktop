@@ -49,52 +49,6 @@ pub fn initial_screen(state: &State, detected: &[MigratedSource]) -> Screen {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::State;
-
-    fn source(id: &str) -> MigratedSource {
-        MigratedSource { id: id.into(), name: id.into() }
-    }
-
-    #[test]
-    fn disclaimer_shows_first_even_with_data_available() {
-        let state = State::default();
-        let detected = vec![source("flash-player")];
-        assert_eq!(initial_screen(&state, &detected), Screen::Disclaimer);
-    }
-
-    #[test]
-    fn setup_shows_only_when_data_detected() {
-        let state = State { disclaimer_accepted: true, ..State::default() };
-        let detected = vec![source("flash-player"), source("evolved-dragonfable-launcher")];
-        assert_eq!(
-            initial_screen(&state, &detected),
-            Screen::Setup { sources: detected.clone() }
-        );
-    }
-
-    #[test]
-    fn setup_skipped_when_no_data() {
-        let state = State { disclaimer_accepted: true, ..State::default() };
-        assert_eq!(initial_screen(&state, &[]), Screen::Playing);
-    }
-
-    #[test]
-    fn setup_skipped_after_migration_choice() {
-        let state = State {
-            disclaimer_accepted: true,
-            migration: Some(crate::config::MigrationChoice {
-                source: None,
-                copied_at_unix: 0,
-            }),
-            ..State::default()
-        };
-        assert_eq!(initial_screen(&state, &[source("flash-player")]), Screen::Playing);
-    }
-}
-
 /// Minimal `UiBackend`: mouse cursor + clipboard + fullscreen via winit/arboard,
 /// device fonts via fontdb, everything else a no-op or `None`.
 pub struct MinimalUiBackend {
@@ -258,5 +212,50 @@ impl UiBackend for MinimalUiBackend {
         _domain: String,
     ) -> Option<ruffle_core::backend::ui::DialogResultFuture> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::State;
+
+    fn source(id: &str) -> MigratedSource {
+        MigratedSource { id: id.into(), name: id.into() }
+    }
+
+    #[test]
+    fn disclaimer_shows_first_even_with_data_available() {
+        let state = State::default();
+        let detected = vec![source("flash-player")];
+        assert_eq!(initial_screen(&state, &detected), Screen::Disclaimer);
+    }
+
+    #[test]
+    fn setup_shows_only_when_data_detected() {
+        let state = State { disclaimer_accepted: true, ..State::default() };
+        let detected = vec![source("flash-player"), source("evolved-dragonfable-launcher")];
+        assert_eq!(
+            initial_screen(&state, &detected),
+            Screen::Setup { sources: detected.clone() }
+        );
+    }
+
+    #[test]
+    fn setup_skipped_when_no_data() {
+        let state = State { disclaimer_accepted: true, ..State::default() };
+        assert_eq!(initial_screen(&state, &[]), Screen::Playing);
+    }
+
+    #[test]
+    fn setup_skipped_after_migration_choice() {
+        let state = State {
+            disclaimer_accepted: true,
+            migration: Some(crate::config::MigrationChoice {
+                source: None,
+                copied_at_unix: 0,
+            }),
+        };
+        assert_eq!(initial_screen(&state, &[source("flash-player")]), Screen::Playing);
     }
 }
