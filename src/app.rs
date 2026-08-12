@@ -333,7 +333,7 @@ impl App {
             dragonfable_cache::clear_cache_dir(&config::cache_dir())
         };
         let message = match result {
-            Ok(()) => "Cache cleared — save data was preserved".to_string(),
+            Ok(()) => "Cache cleared".to_string(),
             Err(error) => {
                 tracing::warn!("Could not clear cache: {error}");
                 format!("Could not clear cache: {error}")
