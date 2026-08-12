@@ -28,6 +28,10 @@ use crate::migration;
 use crate::player::{RuffleEvent, build_player, refetch_root_movie};
 use crate::ui::{MigratedSource, Screen, initial_screen};
 
+/// The wgpu backend family the app renders with. GL is used (not Vulkan)
+/// because the Vulkan backend currently has a memory leak in wgpu.
+const GRAPHICS_BACKENDS: wgpu::Backends = wgpu::Backends::GL;
+
 pub struct App {
     window: Option<Arc<Window>>,
     event_loop: EventLoopProxy<RuffleEvent>,
@@ -82,13 +86,13 @@ impl App {
         );
 
         // wgpu instance + adapter + device (mirrors ruffle_desktop gui/controller.rs:52-118).
-        let instance = create_wgpu_instance(wgpu::Backends::all(), wgpu::BackendOptions::default());
+        let instance = create_wgpu_instance(GRAPHICS_BACKENDS, wgpu::BackendOptions::default());
         let surface = unsafe {
             instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(window.as_ref())?)?
         };
         let (adapter, device, queue) =
             futures::executor::block_on(request_adapter_and_device(
-                wgpu::Backends::all(),
+                GRAPHICS_BACKENDS,
                 &instance,
                 Some(&surface),
                 wgpu::PowerPreference::HighPerformance,
