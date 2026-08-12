@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use egui::ViewportId;
+use dragonfable_cache::CacheHandle;
 use ruffle_core::events::{
     ImeEvent, MouseButton, MouseInputSource, MouseWheelDelta, PlayerEvent,
 };
@@ -32,6 +33,9 @@ use crate::ui::{MigratedSource, Screen, initial_screen};
 /// because the Vulkan backend currently has a memory leak in wgpu.
 const GRAPHICS_BACKENDS: wgpu::Backends = wgpu::Backends::GL;
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const APP_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(0x66, 0x00, 0x00);
+const MENU_BAR_HEIGHT: f32 = 28.0;
+const LAUNCHER_BUTTON_SIZE: egui::Vec2 = egui::vec2(240.0, 42.0);
 
 fn shutdown_runtime_bound<T>(
     resource: &mut Option<T>,
@@ -62,6 +66,7 @@ pub struct App {
     surface_format: Option<wgpu::TextureFormat>,
     // player state
     player: Option<Arc<Mutex<Player>>>,
+    cache_handle: Option<CacheHandle>,
     movie_size: Arc<Mutex<Option<(u32, u32)>>>,
     /// The GPU texture the player renders into, sized to the movie's current
     /// on-screen area in physical pixels.
@@ -75,6 +80,7 @@ pub struct App {
     time: Instant,
     last_pointer: PhysicalPosition<f64>,
     modifiers: Modifiers,
+    cache_notice: Option<(String, Instant)>,
     /// Tokio runtime whose context must be entered whenever ruffle futures are
     /// polled or player methods may touch the navigator (ruffle's backend uses
     /// `tokio::spawn` directly, which panics without an entered runtime).
@@ -154,6 +160,7 @@ impl App {
 
         // egui setup (mirrors controller.rs:118-145).
         let egui_ctx = egui::Context::default();
+        configure_style(&egui_ctx);
         let mut egui_winit = egui_winit::State::new(
             egui_ctx,
             ViewportId::ROOT,
@@ -213,6 +220,7 @@ impl App {
             surface: Some(surface),
             surface_format: Some(surface_format),
             player: None,
+            cache_handle: None,
             movie_size,
             movie_target: None,
             movie_texture_id: None,
@@ -222,6 +230,7 @@ impl App {
             time: Instant::now(),
             last_pointer: PhysicalPosition::new(0.0, 0.0),
             modifiers: Modifiers::default(),
+            cache_notice: None,
             runtime: Some(runtime),
         };
         if matches!(app.screen, Screen::Playing) {
@@ -256,7 +265,7 @@ impl App {
         }
         let window = self.window.clone().expect("window exists");
         let descriptors = self.descriptors.clone().expect("descriptors exist");
-        let (player, target) = build_player(
+        let (player, target, cache_handle) = build_player(
             &window,
             &descriptors,
             &self.event_loop,
@@ -267,6 +276,7 @@ impl App {
         .expect("player construction failed");
         self.movie_target = Some(target);
         self.player = Some(player);
+        self.cache_handle = Some(cache_handle);
         self.screen = Screen::Playing;
     }
 
@@ -283,6 +293,47 @@ impl App {
         }
     }
 
+    fn toggle_fullscreen(&mut self) {
+        let fullscreen = self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.fullscreen().is_some());
+        if let Some(player) = &self.player {
+            let mut player = player.lock().unwrap();
+            player.set_fullscreen(!fullscreen);
+        } else if let Some(window) = &self.window {
+            use winit::window::Fullscreen;
+            window.set_fullscreen((!fullscreen).then(|| Fullscreen::Borderless(None)));
+        }
+    }
+
+    fn clear_game_cache(&mut self) {
+        let result = if let Some(cache_handle) = &self.cache_handle {
+            cache_handle.clear()
+        } else {
+            dragonfable_cache::clear_cache_dir(&config::cache_dir())
+        };
+        let message = match result {
+            Ok(()) => "Cache cleared".to_string(),
+            Err(error) => {
+                tracing::warn!("Could not clear cache: {error}");
+                format!("Could not clear cache: {error}")
+            }
+        };
+        self.cache_notice = Some((message, Instant::now()));
+    }
+
+    fn apply_menu_action(&mut self, action: AppMenuAction) {
+        match action {
+            AppMenuAction::ToggleFullscreen => self.toggle_fullscreen(),
+            AppMenuAction::ClearCache => self.clear_game_cache(),
+        }
+        self.window
+            .as_ref()
+            .expect("window exists")
+            .request_redraw();
+    }
+
     fn movie_rect(&self) -> egui::Rect {
         let size = (*self.movie_size.lock().unwrap()).unwrap_or((800, 600));
         // egui positions and sizes are logical points (egui-winit divides by
@@ -290,7 +341,12 @@ impl App {
         // window size or the movie is drawn scale_factor× too large.
         let window = self.window.as_ref().expect("window exists");
         let logical = window.inner_size().to_logical::<f64>(window.scale_factor());
-        movie_rect_for(size, (logical.width, logical.height))
+        let mut rect = movie_rect_for(
+            size,
+            (logical.width, (logical.height - MENU_BAR_HEIGHT as f64).max(1.0)),
+        );
+        rect = rect.translate(egui::vec2(0.0, MENU_BAR_HEIGHT));
+        rect
     }
 
     fn window_to_movie_viewport(&self, pos: PhysicalPosition<f64>) -> (f64, f64) {
@@ -309,9 +365,13 @@ impl App {
         let movie_size = (*self.movie_size.lock().unwrap()).unwrap_or((800, 600));
         let window = self.window.as_ref().expect("window exists");
         let window_size = window.inner_size();
+        let menu_height = (MENU_BAR_HEIGHT * window.scale_factor() as f32).round() as u32;
         let viewport_size = movie_viewport_size_for(
             movie_size,
-            (window_size.width, window_size.height),
+            (
+                window_size.width,
+                window_size.height.saturating_sub(menu_height).max(1),
+            ),
         );
         let scale_factor = window.scale_factor();
         let Some(player) = &self.player else {
@@ -403,7 +463,24 @@ impl App {
             .expect("egui state exists")
             .egui_ctx()
             .clone();
+        let mut menu_action = None;
+        if self
+            .cache_notice
+            .as_ref()
+            .is_some_and(|(_, shown_at)| shown_at.elapsed() >= Duration::from_secs(3))
+        {
+            self.cache_notice = None;
+        }
+        let fullscreen = self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.fullscreen().is_some());
         let full_output = egui_ctx.run(raw_input, |ctx| {
+            menu_action = application_menu_ui(
+                ctx,
+                fullscreen,
+                self.cache_notice.as_ref().map(|(message, _)| message.as_str()),
+            );
             match &self.screen {
                 Screen::Disclaimer => {
                     if disclaimer_ui(ctx) {
@@ -458,6 +535,10 @@ impl App {
             }
         });
 
+        if let Some(action) = menu_action {
+            self.apply_menu_action(action);
+        }
+
         self.egui_winit
             .as_mut()
             .expect("egui state exists")
@@ -509,7 +590,12 @@ impl App {
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0x66 as f64 / 255.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 1.0,
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -843,6 +929,17 @@ impl ApplicationHandler<RuffleEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let _runtime_guard = self.enter_runtime();
+        let notice_deadline = self
+            .cache_notice
+            .as_ref()
+            .map(|(_, shown_at)| *shown_at + Duration::from_secs(3));
+        if notice_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            self.cache_notice = None;
+            self.window
+                .as_ref()
+                .expect("window exists")
+                .request_redraw();
+        }
         if matches!(self.screen, Screen::Playing) && self.player.is_some() {
             let new_time = Instant::now();
             let dt = FloatDuration::from_std(new_time.duration_since(self.time));
@@ -864,6 +961,8 @@ impl ApplicationHandler<RuffleEvent> for App {
             {
                 self.window.as_ref().expect("window exists").request_redraw();
             }
+        } else if let Some(deadline) = notice_deadline {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
@@ -874,23 +973,125 @@ impl ApplicationHandler<RuffleEvent> for App {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppMenuAction {
+    ToggleFullscreen,
+    ClearCache,
+}
+
+fn configure_style(ctx: &egui::Context) {
+    use egui::{Color32, CornerRadius, FontId, Stroke, TextStyle};
+
+    let ivory = Color32::from_rgb(0xF4, 0xE8, 0xD0);
+    let bronze = Color32::from_rgb(0xC0, 0x8A, 0x47);
+    let mut style = (*ctx.style()).clone();
+    style.visuals = egui::Visuals::dark();
+    style.visuals.override_text_color = Some(ivory);
+    style.visuals.panel_fill = APP_BACKGROUND;
+    style.visuals.window_fill = APP_BACKGROUND;
+    style.visuals.extreme_bg_color = Color32::from_rgb(0x38, 0x08, 0x08);
+    style.visuals.faint_bg_color = Color32::from_rgb(0x5A, 0x00, 0x00);
+    style.visuals.selection.bg_fill = bronze;
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, ivory);
+
+    style.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(0x3E, 0x0B, 0x0B);
+    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(0x3E, 0x0B, 0x0B);
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, bronze);
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, ivory);
+    style.visuals.widgets.inactive.corner_radius = CornerRadius::same(5);
+
+    style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x86, 0x18, 0x18);
+    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x86, 0x18, 0x18);
+    style.visuals.widgets.hovered.bg_stroke =
+        Stroke::new(1.5_f32, Color32::from_rgb(0xE2, 0xB8, 0x70));
+    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
+    style.visuals.widgets.hovered.corner_radius = CornerRadius::same(5);
+
+    style.visuals.widgets.active.weak_bg_fill = Color32::from_rgb(0x2B, 0x06, 0x06);
+    style.visuals.widgets.active.bg_fill = Color32::from_rgb(0x2B, 0x06, 0x06);
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, bronze);
+    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+    style.visuals.widgets.active.corner_radius = CornerRadius::same(5);
+
+    style.spacing.button_padding = egui::vec2(16.0, 9.0);
+    style.text_styles.insert(TextStyle::Heading, FontId::proportional(30.0));
+    style.text_styles.insert(TextStyle::Body, FontId::proportional(16.0));
+    style.text_styles.insert(TextStyle::Button, FontId::proportional(16.0));
+    ctx.set_style(style);
+}
+
+fn application_menu_ui(
+    ctx: &egui::Context,
+    fullscreen: bool,
+    notice: Option<&str>,
+) -> Option<AppMenuAction> {
+    let mut action = None;
+    egui::TopBottomPanel::top("application_menu")
+        .exact_height(MENU_BAR_HEIGHT)
+        .frame(egui::Frame::NONE.fill(APP_BACKGROUND))
+        .show(ctx, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button("Application", |ui| {
+                    let fullscreen_label = if fullscreen {
+                        "Exit fullscreen"
+                    } else {
+                        "Enter fullscreen"
+                    };
+                    if ui.button(fullscreen_label).clicked() {
+                        action = Some(AppMenuAction::ToggleFullscreen);
+                        ui.close();
+                    }
+                    if ui.button("Clear cache").clicked() {
+                        action = Some(AppMenuAction::ClearCache);
+                        ui.close();
+                    }
+                });
+                if let Some(notice) = notice {
+                    ui.separator();
+                    ui.label(notice);
+                }
+            });
+        });
+    action
+}
+
+fn launcher_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
+    ui.add(egui::Button::new(text).min_size(LAUNCHER_BUTTON_SIZE))
+}
+
+fn centered_screen(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let available = ui.available_rect_before_wrap();
+    let content_rect = egui::Rect::from_center_size(
+        available.center(),
+        egui::vec2(available.width().min(560.0), available.height()),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(
+                egui::Layout::top_down(egui::Align::Center)
+                    .with_main_align(egui::Align::Center),
+            ),
+        add_contents,
+    );
+}
+
 // Pure egui widgets for the overlay screens. (These live in app.rs for now;
 // they are the designated growth point for future settings UI.)
 fn disclaimer_ui(ctx: &egui::Context) -> bool {
     let mut continue_clicked = false;
     egui::CentralPanel::default()
-        .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(0x66, 0x00, 0x00)))
+        .frame(egui::Frame::NONE.fill(APP_BACKGROUND))
         .show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(120.0);
+            centered_screen(ui, |ui| {
                 ui.heading("Disclaimer");
                 ui.add_space(24.0);
-                ui.label(
+                ui.add(egui::Label::new(
                     "This is a 3rd party launcher that is not supported nor endorsed by Artix Entertainment.",
-                );
+                ).wrap());
                 ui.label("By clicking 'Continue', you agree to use this launcher at your own risk.");
                 ui.add_space(32.0);
-                if ui.button("Continue").clicked() {
+                if launcher_button(ui, "Continue").clicked() {
                     continue_clicked = true;
                 }
             });
@@ -901,24 +1102,25 @@ fn disclaimer_ui(ctx: &egui::Context) -> bool {
 fn setup_ui(ctx: &egui::Context, sources: &[MigratedSource]) -> Option<Option<usize>> {
     let mut choice = None;
     egui::CentralPanel::default()
-        .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(0x00, 0x33, 0x00)))
+        .frame(egui::Frame::NONE.fill(APP_BACKGROUND))
         .show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
+            centered_screen(ui, |ui| {
                 ui.heading("Save data found");
                 ui.add_space(16.0);
                 ui.label("We found save data from another DragonFable launcher.");
                 ui.label("Would you like to copy it into DragonFable?");
                 ui.add_space(24.0);
-            });
-            for (index, source) in sources.iter().enumerate() {
-                if ui.button(format!("Copy from {}", source.name)).clicked() {
-                    choice = Some(Some(index));
+                for (index, source) in sources.iter().enumerate() {
+                    if launcher_button(ui, format!("Copy from {}", source.name)).clicked() {
+                        choice = Some(Some(index));
+                    }
+                    ui.add_space(8.0);
                 }
-            }
-            if ui.button("Don't copy").clicked() {
-                choice = Some(None);
-            }
+                ui.add_space(4.0);
+                if launcher_button(ui, "Don't copy").clicked() {
+                    choice = Some(None);
+                }
+            });
         });
     choice
 }
@@ -944,23 +1146,22 @@ fn error_ui_with_geometry(
     let mut action = None;
     let mut buttons = Vec::new();
     egui::CentralPanel::default()
-        .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(0x66, 0x00, 0x00)))
+        .frame(egui::Frame::NONE.fill(APP_BACKGROUND))
         .show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(80.0);
+            centered_screen(ui, |ui| {
                 ui.heading("Failed to load DragonFable");
                 ui.add_space(16.0);
-                ui.label(message);
+                ui.add(egui::Label::new(message).wrap());
                 ui.add_space(24.0);
                 if can_retry {
-                    let response = ui.button("Retry");
+                    let response = launcher_button(ui, "Retry");
                     if response.clicked() {
                         action = Some(ErrorAction::Retry);
                     }
                     buttons.push((ErrorAction::Retry, response.rect));
                     ui.add_space(8.0);
                 }
-                let response = ui.button("Quit");
+                let response = launcher_button(ui, "Quit");
                 if response.clicked() {
                     action = Some(ErrorAction::Quit);
                 }
@@ -972,10 +1173,9 @@ fn error_ui_with_geometry(
 
 fn loading_ui(ctx: &egui::Context) {
     egui::CentralPanel::default()
-        .frame(egui::Frame::NONE)
+        .frame(egui::Frame::NONE.fill(APP_BACKGROUND))
         .show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(200.0);
+            centered_screen(ui, |ui| {
                 ui.label("Loading DragonFable…");
             });
         });

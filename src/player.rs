@@ -26,7 +26,7 @@ use winit::window::Window;
 use crate::config::{self, BASE_DOMAIN, CACHE_MAX_BYTES, GAME_URL};
 use crate::navigator::MinimalNavigatorInterface;
 use crate::ui::MinimalUiBackend;
-use dragonfable_cache::{Config, DragonFableCachingNavigator};
+use dragonfable_cache::{CacheHandle, Config, DragonFableCachingNavigator};
 
 /// Events the winit event loop processes for us.
 pub enum RuffleEvent {
@@ -87,7 +87,7 @@ pub fn build_player(
     font_database: Rc<fontdb::Database>,
     movie_size: Arc<Mutex<Option<(u32, u32)>>>,
     root_error: Arc<Mutex<Option<String>>>,
-) -> anyhow::Result<(Arc<Mutex<Player>>, TextureTarget)> {
+) -> anyhow::Result<(Arc<Mutex<Player>>, TextureTarget, CacheHandle)> {
     let future_spawner = WinitExecutor { event_loop: event_loop.clone() };
 
     let movie_url = Url::parse(GAME_URL).context("hardcoded game URL must parse")?;
@@ -115,6 +115,7 @@ pub fn build_player(
         },
         future_spawner,
     );
+    let cache_handle = navigator.cache_handle();
 
     let movie_size_px = movie_size.lock().unwrap().unwrap_or((800, 600));
     let render_target = TextureTarget::new(&descriptors.device, movie_size_px)
@@ -187,7 +188,7 @@ pub fn build_player(
 
     refetch_root_movie(&player, &movie_size);
 
-    Ok((player, movie_target))
+    Ok((player, movie_target, cache_handle))
 }
 
 /// Kicks off (or re-kicks off, after a failed download) the root movie fetch,
