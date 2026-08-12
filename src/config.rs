@@ -18,17 +18,17 @@ pub fn cache_dir() -> PathBuf {
     join(dirs::cache_dir(), "dragonfable")
 }
 
-/// `$XDG_DATA_HOME/dragonfable/SharedObjects` (Linux) / `%APPDATA%\dragonfable\SharedObjects` (Windows).
+/// `$XDG_DATA_HOME/dragonfable/SharedObjects` (Linux) / `%LOCALAPPDATA%\dragonfable\SharedObjects` (Windows).
 pub fn save_dir() -> PathBuf {
     join(dirs::data_local_dir(), "dragonfable/SharedObjects")
 }
 
-/// `$XDG_CONFIG_HOME/dragonfable` (Linux) / `%APPDATA%\dragonfable` (Windows).
+/// `$XDG_CONFIG_HOME/dragonfable` (Linux) / `%LOCALAPPDATA%\dragonfable` (Windows).
 pub fn config_dir() -> PathBuf {
     join(dirs::config_local_dir(), "dragonfable")
 }
 
-/// `$XDG_DATA_HOME/dragonfable/log` (Linux) / `%APPDATA%\dragonfable\log` (Windows).
+/// `$XDG_DATA_HOME/dragonfable/log` (Linux) / `%LOCALAPPDATA%\dragonfable\log` (Windows).
 pub fn log_dir() -> PathBuf {
     join(dirs::data_local_dir(), "dragonfable/log")
 }

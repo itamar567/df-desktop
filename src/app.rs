@@ -17,7 +17,7 @@ use ruffle_render_wgpu::backend::{
 use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::target::TextureTarget;
 use winit::application::ApplicationHandler;
-use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalPosition, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, Modifiers, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
@@ -252,14 +252,22 @@ impl App {
 
     fn movie_rect(&self) -> egui::Rect {
         let size = (*self.movie_size.lock().unwrap()).unwrap_or((800, 600));
-        let window = self.window.as_ref().expect("window exists").inner_size();
-        movie_rect_for(size, (window.width, window.height))
+        // egui positions and sizes are logical points (egui-winit divides by
+        // the scale factor), so the letterbox rect must come from the logical
+        // window size or the movie is drawn scale_factor× too large.
+        let window = self.window.as_ref().expect("window exists");
+        let logical = window.inner_size().to_logical::<f64>(window.scale_factor());
+        movie_rect_for(size, (logical.width, logical.height))
     }
 
     fn window_to_movie(&self, pos: PhysicalPosition<f64>) -> (f64, f64) {
+        // Pointer events arrive in physical pixels but the movie rect is in
+        // logical points, so convert before mapping.
+        let window = self.window.as_ref().expect("window exists");
+        let logical = pos.to_logical::<f64>(window.scale_factor());
         let rect = self.movie_rect();
         let size = (*self.movie_size.lock().unwrap()).unwrap_or((800, 600));
-        window_to_movie_for(pos, &rect, size)
+        window_to_movie_for(logical, &rect, size)
     }
 
     /// Keeps the renderer's viewport + the presented egui texture in sync with
@@ -314,6 +322,9 @@ impl App {
                     wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
                         tracing::warn!("Surface became unavailable: {error:?}, reconfiguring");
                         self.reconfigure_surface();
+                        // No frame was presented, so nothing else will wake the
+                        // loop; redraw once the surface is usable again.
+                        self.window.as_ref().expect("window exists").request_redraw();
                         return;
                     }
                     wgpu::SurfaceError::Timeout => {
@@ -529,11 +540,28 @@ impl App {
         } else {
             None
         };
+        let persisted = should_persist_migration(&result);
         match result {
-            Some(Ok(copied)) => tracing::info!("Copied {copied} save files from {source:?}"),
-            Some(Err(error)) => tracing::warn!("Migration copy failed: {error}"),
+            Some(Ok(copied)) => {
+                tracing::info!("Copied {copied} save files from {source:?}");
+            }
+            Some(Err(error)) => {
+                tracing::error!(
+                    "Migration copy failed, setup screen will show again on next run: {error}"
+                );
+            }
             None => {}
         }
+        if persisted {
+            self.persist_migration_choice(source);
+        }
+        self.screen = Screen::Playing;
+        self.start_game();
+    }
+
+    /// Records the user's migration choice; only called after a successful
+    /// copy or an explicit decline, never after a failed copy.
+    fn persist_migration_choice(&mut self, source: Option<String>) {
         self.state.migration = Some(crate::config::MigrationChoice {
             source,
             copied_at_unix: std::time::SystemTime::now()
@@ -542,8 +570,6 @@ impl App {
                 .unwrap_or(0),
         });
         let _ = self.state.save(&config::config_dir());
-        self.screen = Screen::Playing;
-        self.start_game();
     }
 }
 
@@ -575,18 +601,27 @@ fn register_movie_texture(
     egui_renderer.register_native_texture(device, &view, wgpu::FilterMode::Linear)
 }
 
-/// Aspect-fits `movie` inside `window`, centered. Both sides clamp to 1px so
-/// the result is always a valid rect.
-fn movie_rect_for(movie: (u32, u32), window: (u32, u32)) -> egui::Rect {
+/// Whether a migration copy result should record the user's choice: only a
+/// successful copy (or an explicit decline) persists, so a failed copy leaves
+/// the setup screen visible on the next run.
+fn should_persist_migration(result: &Option<std::io::Result<usize>>) -> bool {
+    !matches!(result, Some(Err(_)))
+}
+
+/// Aspect-fits `movie` inside `window` (a logical-point size), centered. Both
+/// sides clamp to a minimum of 1 unit so the result is always a valid rect.
+fn movie_rect_for(movie: (u32, u32), window: (f64, f64)) -> egui::Rect {
     let (mw, mh) = (movie.0.max(1) as f32, movie.1.max(1) as f32);
-    let (ww, wh) = (window.0.max(1) as f32, window.1.max(1) as f32);
+    let (ww, wh) = (window.0.max(1.0) as f32, window.1.max(1.0) as f32);
     let scale = (ww / mw).min(wh / mh);
     let (w, h) = (mw * scale, mh * scale);
     egui::Rect::from_min_size(egui::pos2((ww - w) / 2.0, (wh - h) / 2.0), egui::vec2(w, h))
 }
 
+/// Maps a logical-point position (the physical pointer divided by the window's
+/// scale factor) into movie coordinates inside `rect`.
 fn window_to_movie_for(
-    pos: PhysicalPosition<f64>,
+    pos: LogicalPosition<f64>,
     rect: &egui::Rect,
     movie: (u32, u32),
 ) -> (f64, f64) {
@@ -1024,14 +1059,14 @@ mod tests {
 
     #[test]
     fn movie_rect_fills_window_when_aspects_match() {
-        let rect = movie_rect_for((800, 600), (800, 600));
+        let rect = movie_rect_for((800, 600), (800.0, 600.0));
         assert_eq!(rect.min, egui::pos2(0.0, 0.0));
         assert_eq!(rect.max, egui::pos2(800.0, 600.0));
     }
 
     #[test]
     fn movie_rect_letterboxes_a_wider_window() {
-        let rect = movie_rect_for((800, 600), (1600, 600));
+        let rect = movie_rect_for((800, 600), (1600.0, 600.0));
         assert_eq!(rect.min.x, 400.0);
         assert_eq!(rect.min.y, 0.0);
         assert_eq!(rect.width(), 800.0);
@@ -1040,7 +1075,7 @@ mod tests {
 
     #[test]
     fn movie_rect_letterboxes_a_shorter_window() {
-        let rect = movie_rect_for((800, 600), (800, 300));
+        let rect = movie_rect_for((800, 600), (800.0, 300.0));
         assert_eq!(rect.min.x, 200.0);
         assert_eq!(rect.min.y, 0.0);
         assert_eq!(rect.width(), 400.0);
@@ -1049,24 +1084,63 @@ mod tests {
 
     #[test]
     fn movie_rect_clamps_zero_sizes() {
-        let rect = movie_rect_for((0, 0), (0, 0));
+        let rect = movie_rect_for((0, 0), (0.0, 0.0));
         assert!(rect.width() > 0.0);
         assert!(rect.height() > 0.0);
     }
 
     #[test]
+    fn movie_rect_uses_logical_points_at_hidpi_scale_factors() {
+        // 1920x1080 physical @ scale 1.5 -> 1280x720 logical points. The rect
+        // is computed from the logical size: the 4:3 movie letterboxes to
+        // 960x720 at (160, 0), whereas physical-size math would produce a
+        // 1440x1080 rect that is drawn 1.5× too large and cropped.
+        let rect = movie_rect_for((800, 600), (1280.0, 720.0));
+        assert!((rect.min.x - 160.0).abs() < 1e-3);
+        assert!(rect.min.y.abs() < 1e-3);
+        assert!((rect.width() - 960.0).abs() < 1e-3);
+        assert!((rect.height() - 720.0).abs() < 1e-3);
+    }
+
+    #[test]
     fn window_to_movie_maps_into_the_letterboxed_rect() {
-        let rect = movie_rect_for((800, 600), (1600, 600));
+        let rect = movie_rect_for((800, 600), (1600.0, 600.0));
         // Center of the window == center of the movie.
-        let (x, y) = window_to_movie_for(PhysicalPosition::new(800.0, 300.0), &rect, (800, 600));
+        let (x, y) = window_to_movie_for(LogicalPosition::new(800.0, 300.0), &rect, (800, 600));
         assert!((x - 400.0).abs() < 1e-3);
         assert!((y - 300.0).abs() < 1e-3);
         // Left edge of the movie rect == movie x 0.
-        let (x, _) = window_to_movie_for(PhysicalPosition::new(400.0, 0.0), &rect, (800, 600));
+        let (x, _) = window_to_movie_for(LogicalPosition::new(400.0, 0.0), &rect, (800, 600));
         assert!(x.abs() < 1e-3);
         // Outside the movie rect maps to negative coordinates.
-        let (x, _) = window_to_movie_for(PhysicalPosition::new(0.0, 0.0), &rect, (800, 600));
+        let (x, _) = window_to_movie_for(LogicalPosition::new(0.0, 0.0), &rect, (800, 600));
         assert!(x < 0.0);
+    }
+
+    #[test]
+    fn window_to_movie_maps_physical_pointer_through_logical_space() {
+        // 1920x1080 physical @ scale 1.5 -> 1280x720 logical points; the
+        // movie rect is (160, 0)..(1120, 720).
+        let rect = movie_rect_for((800, 600), (1280.0, 720.0));
+        // Physical center (960, 540) -> logical (640, 360): the movie center.
+        let logical = PhysicalPosition::new(960.0, 540.0).to_logical::<f64>(1.5);
+        let (x, y) = window_to_movie_for(logical, &rect, (800, 600));
+        assert!((x - 400.0).abs() < 1e-3);
+        assert!((y - 300.0).abs() < 1e-3);
+        // Physical (240, 0) -> logical (160, 0): the movie rect's left edge,
+        // i.e. movie x = 0.
+        let logical = PhysicalPosition::new(240.0, 0.0).to_logical::<f64>(1.5);
+        let (x, _) = window_to_movie_for(logical, &rect, (800, 600));
+        assert!(x.abs() < 1e-3);
+    }
+
+    #[test]
+    fn migration_choice_persists_only_on_success_or_decline() {
+        assert!(should_persist_migration(&None));
+        assert!(should_persist_migration(&Some(Ok(3))));
+        assert!(!should_persist_migration(&Some(Err(std::io::Error::other(
+            "copy failed"
+        )))));
     }
 }
 
