@@ -66,6 +66,8 @@ pub struct App {
     egui_renderer: Option<egui_wgpu::Renderer>,
     surface: Option<wgpu::Surface<'static>>,
     surface_format: Option<wgpu::TextureFormat>,
+    /// Minimized windows have no drawable swap chain on some platforms.
+    minimized: bool,
     // player state
     player: Option<Arc<Mutex<Player>>>,
     cache_handle: Option<CacheHandle>,
@@ -225,6 +227,7 @@ impl App {
             egui_renderer: Some(egui_renderer),
             surface: Some(surface),
             surface_format: Some(surface_format),
+            minimized: false,
             player: None,
             cache_handle: None,
             movie_size,
@@ -856,7 +859,9 @@ impl ApplicationHandler<RuffleEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let _runtime_guard = self.enter_runtime();
         if let WindowEvent::RedrawRequested = &event {
-            self.render(event_loop);
+            if !self.minimized {
+                self.render(event_loop);
+            }
             return;
         }
 
@@ -996,7 +1001,11 @@ impl ApplicationHandler<RuffleEvent> for App {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+            WindowEvent::Resized(size) => {
+                self.minimized = size.width == 0 && size.height == 0;
+                self.reconfigure_surface();
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
                 self.reconfigure_surface();
             }
             WindowEvent::ModifiersChanged(new_modifiers) => {
