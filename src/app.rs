@@ -477,23 +477,24 @@ impl App {
         let surface_texture = {
             let surface = self.surface.as_ref().expect("surface exists");
             match surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(texture)
-                | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
-                error @ (wgpu::CurrentSurfaceTexture::Lost
-                | wgpu::CurrentSurfaceTexture::Outdated) => {
-                    tracing::warn!("Surface became unavailable: {error:?}, reconfiguring");
-                    self.reconfigure_surface();
-                    // No frame was presented, so nothing else will wake the
-                    // loop; redraw once the surface is usable again.
-                    self.window.as_ref().expect("window exists").request_redraw();
-                    return;
-                }
-                error @ (wgpu::CurrentSurfaceTexture::Timeout
-                | wgpu::CurrentSurfaceTexture::Occluded
-                | wgpu::CurrentSurfaceTexture::Validation) => {
-                    tracing::warn!("Surface became unavailable: {error:?}, skipping frame");
-                    return;
-                }
+                Ok(texture) => texture,
+                Err(error) => match error {
+                    wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
+                        tracing::warn!("Surface became unavailable: {error:?}, reconfiguring");
+                        self.reconfigure_surface();
+                        // No frame was presented, so nothing else will wake the
+                        // loop; redraw once the surface is usable again.
+                        self.window.as_ref().expect("window exists").request_redraw();
+                        return;
+                    }
+                    wgpu::SurfaceError::Timeout => {
+                        tracing::warn!("Surface became unavailable: {error:?}, skipping frame");
+                        return;
+                    }
+                    wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other => {
+                        panic!("wgpu: surface error: {error:?}");
+                    }
+                },
             }
         };
 
@@ -673,7 +674,6 @@ impl App {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
-                    multiview_mask: None,
                 })
                 .forget_lifetime();
             self.egui_renderer
@@ -1307,7 +1307,7 @@ fn configure_style(ctx: &egui::Context) {
 
     let ivory = Color32::from_rgb(0xF4, 0xE8, 0xD0);
     let bronze = Color32::from_rgb(0xC0, 0x8A, 0x47);
-    let mut style = (*ctx.global_style()).clone();
+    let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::dark();
     style.visuals.override_text_color = Some(ivory);
     style.visuals.panel_fill = APP_BACKGROUND;
@@ -1340,7 +1340,7 @@ fn configure_style(ctx: &egui::Context) {
     style.text_styles.insert(TextStyle::Heading, FontId::proportional(30.0));
     style.text_styles.insert(TextStyle::Body, FontId::proportional(16.0));
     style.text_styles.insert(TextStyle::Button, FontId::proportional(16.0));
-    ctx.set_global_style(style);
+    ctx.set_style(style);
 }
 
 fn launcher_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
