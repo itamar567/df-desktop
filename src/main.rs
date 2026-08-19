@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod input;
+mod log;
 mod migration;
 mod navigator;
 mod player;

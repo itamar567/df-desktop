@@ -24,7 +24,8 @@ use winit::event_loop::EventLoopProxy;
 use winit::window::Window;
 
 use crate::config::{self, BASE_DOMAIN, CACHE_MAX_BYTES, GAME_URL};
-use crate::navigator::MinimalNavigatorInterface;
+use crate::log::{LogListener, SharedLogState};
+use crate::navigator::DesktopNavigatorInterface;
 use crate::ui::MinimalUiBackend;
 use dragonfable_cache::{CacheHandle, Config, DragonFableCachingNavigator};
 
@@ -87,6 +88,7 @@ pub fn build_player(
     font_database: Rc<fontdb::Database>,
     movie_size: Arc<Mutex<Option<(u32, u32)>>>,
     root_error: Arc<Mutex<Option<String>>>,
+    log_state: SharedLogState,
 ) -> anyhow::Result<(Arc<Mutex<Player>>, TextureTarget, CacheHandle)> {
     let future_spawner = WinitExecutor { event_loop: event_loop.clone() };
 
@@ -106,7 +108,7 @@ pub fn build_player(
             Rc::new(PlayingContent::DirectFile(ContentDescriptor::new_remote(
                 movie_url.clone(),
             ))),
-            MinimalNavigatorInterface,
+            DesktopNavigatorInterface { log_state: log_state.clone() },
         ),
         Config {
             cache_dir: config::cache_dir(),
@@ -130,6 +132,9 @@ pub fn build_player(
     let renderer = WgpuRenderBackend::new(descriptors.clone(), render_target)
         .map_err(|e| anyhow!("failed to create wgpu render backend: {e}"))?;
 
+    let log_listener = Arc::new(LogListener::new(log_state.clone()));
+    let listeners = Arc::new(Mutex::new(vec![log_listener as Arc<dyn ruffle_core::local_connection::LocalConnectionListener>]));
+    
     let mut builder = PlayerBuilder::new()
         .with_navigator(navigator)
         .with_renderer(renderer)
@@ -142,7 +147,8 @@ pub fn build_player(
         .with_video(SoftwareVideoBackend::new())
         .with_autoplay(true)
         .with_letterbox(Letterbox::On)
-        .with_max_execution_duration(Duration::MAX);
+        .with_max_execution_duration(Duration::MAX)
+        .with_local_connection_listeners(listeners);
 
     if let Ok(audio) = CpalAudioBackend::new(None) {
         builder = builder.with_audio(audio);

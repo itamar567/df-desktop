@@ -26,6 +26,7 @@ use winit::window::{Window, WindowId};
 
 use crate::config::{self, State};
 use crate::input::{winit_input_to_ruffle_key_descriptor, winit_to_ruffle_text_control};
+use crate::log::{LogTab, SharedLogState, new_shared_log_state, parse_log_content};
 use crate::migration;
 use crate::player::{RuffleEvent, build_player, refetch_root_movie};
 use crate::ui::{MigratedSource, Screen, initial_screen};
@@ -38,6 +39,7 @@ const APP_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(0x66, 0x00, 0x00);
 const LAUNCHER_BUTTON_SIZE: egui::Vec2 = egui::vec2(240.0, 42.0);
 const TOAST_DURATION: Duration = Duration::from_secs(3);
 const TOAST_FADE_DURATION: Duration = Duration::from_millis(450);
+const LOG_PANEL_WIDTH: f64 = 320.0;
 
 fn shutdown_runtime_bound<T>(
     resource: &mut Option<T>,
@@ -93,6 +95,8 @@ pub struct App {
     /// polled or player methods may touch the navigator (ruffle's backend uses
     /// `tokio::spawn` directly, which panics without an entered runtime).
     runtime: Option<tokio::runtime::Runtime>,
+    /// Shared state for the external/side-by-side log display.
+    log_state: SharedLogState,
 }
 
 impl App {
@@ -216,6 +220,7 @@ impl App {
         let movie_size = Arc::new(Mutex::new(None));
         let root_error = Arc::new(Mutex::new(None));
 
+        let log_state = new_shared_log_state();
         let mut app = Self {
             window: Some(window),
             event_loop: event_loop_proxy,
@@ -245,6 +250,7 @@ impl App {
             launcher_pointer_captured: false,
             toast: None,
             runtime: Some(runtime),
+            log_state,
         };
         if matches!(app.screen, Screen::Playing) {
             app.start_game();
@@ -285,6 +291,7 @@ impl App {
             self.font_database.clone(),
             self.movie_size.clone(),
             self.root_error.clone(),
+            self.log_state.clone(),
         )
         .expect("player construction failed");
         self.movie_target = Some(target);
@@ -410,7 +417,8 @@ impl App {
         // window size or the movie is drawn scale_factor× too large.
         let window = self.window.as_ref().expect("window exists");
         let logical = window.inner_size().to_logical::<f64>(window.scale_factor());
-        movie_rect_for(size, (logical.width, logical.height))
+        let available_width = available_game_width(logical.width, &self.log_state);
+        movie_rect_for(size, (available_width, logical.height))
     }
 
     fn window_to_movie_viewport(&self, pos: PhysicalPosition<f64>) -> (f64, f64) {
@@ -429,9 +437,16 @@ impl App {
         let movie_size = (*self.movie_size.lock().unwrap()).unwrap_or((800, 600));
         let window = self.window.as_ref().expect("window exists");
         let window_size = window.inner_size();
-        let viewport_size =
-            movie_viewport_size_for(movie_size, (window_size.width, window_size.height));
         let scale_factor = window.scale_factor();
+        // Use the same logical-point calculation as movie_rect() to stay in sync
+        let logical = window_size.to_logical::<f64>(scale_factor);
+        let available_width = available_game_width(logical.width, &self.log_state);
+        let rect = movie_rect_for(movie_size, (available_width, logical.height));
+        // Convert logical rect to physical pixels for the renderer
+        let viewport_size = (
+            (rect.width() * scale_factor as f32).round().max(1.0) as u32,
+            (rect.height() * scale_factor as f32).round().max(1.0) as u32,
+        );
         let Some(player) = &self.player else {
             return;
         };
@@ -561,6 +576,8 @@ impl App {
                         let mut player_lock = player.lock().unwrap();
                         player_lock.render();
                     }
+                    // Render log panel first so it takes space from the available area
+                    log_panel_ui(ctx, &self.log_state);
                     if let Some(texture_id) = self.movie_texture_id {
                         egui::CentralPanel::default()
                             .frame(egui::Frame::NONE)
@@ -822,14 +839,7 @@ fn movie_rect_for(movie: (u32, u32), window: (f64, f64)) -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2((ww - w) / 2.0, (wh - h) / 2.0), egui::vec2(w, h))
 }
 
-/// Returns the physical-pixel render resolution for an aspect-fitted movie.
-fn movie_viewport_size_for(movie: (u32, u32), window: (u32, u32)) -> (u32, u32) {
-    let rect = movie_rect_for(movie, (window.0 as f64, window.1 as f64));
-    (
-        (rect.width().round() as u32).max(1),
-        (rect.height().round() as u32).max(1),
-    )
-}
+
 
 /// Maps a physical pointer position into Ruffle's physical-pixel viewport.
 fn window_to_movie_viewport_for(
@@ -1302,6 +1312,97 @@ fn toast_ui(ctx: &egui::Context, toast: &Toast, now: Instant) {
         });
 }
 
+/// Renders the log panel for side-by-side mode.
+fn log_panel_ui(ctx: &egui::Context, log_state: &SharedLogState) {
+    use egui::{Color32, Frame, Margin, ScrollArea, Stroke};
+
+    let state = match log_state.lock() {
+        Ok(state) => state.clone(),
+        Err(_) => return,
+    };
+
+    if !state.visible {
+        return;
+    }
+
+    egui::SidePanel::right("log_panel")
+        .exact_width(LOG_PANEL_WIDTH as f32)
+        .frame(
+            Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(0x1A, 0x04, 0x04, 245))
+                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0x8D, 0x5E, 0x2F)))
+                .inner_margin(Margin::symmetric(8, 8)),
+        )
+        .show(ctx, |ui| {
+            // Tab buttons
+            ui.horizontal(|ui| {
+                let game_selected = state.tab == LogTab::Game;
+                let battle_selected = state.tab == LogTab::Battle;
+
+                let game_tab_text = if game_selected {
+                    egui::RichText::new("Game Log").strong().color(Color32::from_rgb(0xFF, 0xF0, 0xD0))
+                } else {
+                    egui::RichText::new("Game Log")
+                };
+                let battle_tab_text = if battle_selected {
+                    egui::RichText::new("Battle Log").strong().color(Color32::from_rgb(0xFF, 0xF0, 0xD0))
+                } else {
+                    egui::RichText::new("Battle Log")
+                };
+
+                let game_btn = ui.add(egui::Button::new(game_tab_text).selected(game_selected));
+                let battle_btn = ui.add(egui::Button::new(battle_tab_text).selected(battle_selected));
+
+                if game_btn.clicked() && let Ok(mut s) = log_state.lock() {
+                    s.tab = LogTab::Game;
+                }
+                if battle_btn.clicked() && let Ok(mut s) = log_state.lock() {
+                    s.tab = LogTab::Battle;
+                }
+            });
+
+            ui.separator();
+
+            // Log content
+            let content = match state.tab {
+                LogTab::Game => &state.game_log,
+                LogTab::Battle => &state.battle_log,
+            };
+
+            ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    // Parse HTML color tags and render with proper colors
+                    let fragments = parse_log_content(content);
+                    let default_color = Color32::from_rgb(0xF4, 0xE8, 0xD0);
+                    
+                    for fragment in &fragments {
+                        let color = fragment.color
+                            .map(|c| Color32::from_rgb(c[0], c[1], c[2]))
+                            .unwrap_or(default_color);
+                        
+                        ui.label(
+                            egui::RichText::new(&fragment.text)
+                                .color(color)
+                                .monospace()
+                                .size(12.0),
+                        );
+                    }
+                });
+        });
+}
+
+/// Returns the available window width for the game when the log panel is visible.
+fn available_game_width(window_width: f64, log_state: &SharedLogState) -> f64 {
+    let show_panel = log_state.lock().map(|s| s.visible).unwrap_or(false);
+    if show_panel {
+        (window_width - LOG_PANEL_WIDTH).max(100.0)
+    } else {
+        window_width
+    }
+}
+
 fn configure_style(ctx: &egui::Context) {
     use egui::{Color32, CornerRadius, FontId, Stroke, TextStyle};
 
@@ -1701,14 +1802,6 @@ mod tests {
         assert!(rect.min.y.abs() < 1e-3);
         assert!((rect.width() - 960.0).abs() < 1e-3);
         assert!((rect.height() - 720.0).abs() < 1e-3);
-    }
-
-    #[test]
-    fn movie_viewport_resolution_tracks_the_aspect_fitted_window_size() {
-        assert_eq!(movie_viewport_size_for((800, 600), (1600, 1200)), (1600, 1200));
-        assert_eq!(movie_viewport_size_for((800, 600), (1600, 600)), (800, 600));
-        assert_eq!(movie_viewport_size_for((800, 600), (800, 300)), (400, 300));
-        assert_eq!(movie_viewport_size_for((0, 0), (0, 0)), (1, 1));
     }
 
     #[test]
