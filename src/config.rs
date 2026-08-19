@@ -13,24 +13,24 @@ fn join(app_dir: Option<PathBuf>, name: &str) -> PathBuf {
     app_dir.expect("could not determine platform directory").join(name)
 }
 
-/// `$XDG_CACHE_HOME/dragonfable` (Linux) / `%LOCALAPPDATA%\dragonfable` (Windows).
+/// `$XDG_CACHE_HOME/itmr-dragonfable-launcher` (Linux) / `%LOCALAPPDATA%\itmr-dragonfable-launcher` (Windows).
 pub fn cache_dir() -> PathBuf {
-    join(dirs::cache_dir(), "dragonfable")
+    join(dirs::cache_dir(), "itmr-dragonfable-launcher")
 }
 
-/// `$XDG_DATA_HOME/dragonfable/SharedObjects` (Linux) / `%LOCALAPPDATA%\dragonfable\SharedObjects` (Windows).
+/// `$XDG_DATA_HOME/itmr-dragonfable-launcher/SharedObjects` (Linux) / `%LOCALAPPDATA%\itmr-dragonfable-launcher\SharedObjects` (Windows).
 pub fn save_dir() -> PathBuf {
-    join(dirs::data_local_dir(), "dragonfable/SharedObjects")
+    join(dirs::data_local_dir(), "itmr-dragonfable-launcher/SharedObjects")
 }
 
-/// `$XDG_CONFIG_HOME/dragonfable` (Linux) / `%LOCALAPPDATA%\dragonfable` (Windows).
+/// `$XDG_CONFIG_HOME/itmr-dragonfable-launcher` (Linux) / `%LOCALAPPDATA%\itmr-dragonfable-launcher` (Windows).
 pub fn config_dir() -> PathBuf {
-    join(dirs::config_local_dir(), "dragonfable")
+    join(dirs::config_local_dir(), "itmr-dragonfable-launcher")
 }
 
-/// `$XDG_DATA_HOME/dragonfable/log` (Linux) / `%LOCALAPPDATA%\dragonfable\log` (Windows).
+/// `$XDG_DATA_HOME/itmr-dragonfable-launcher/log` (Linux) / `%LOCALAPPDATA%\itmr-dragonfable-launcher\log` (Windows).
 pub fn log_dir() -> PathBuf {
-    join(dirs::data_local_dir(), "dragonfable/log")
+    join(dirs::data_local_dir(), "itmr-dragonfable-launcher/log")
 }
 
 /// First-boot state persisted as `state.toml` in [`config_dir`].
@@ -85,16 +85,16 @@ mod tests {
         set_var("XDG_CACHE_HOME", Some("/tmp/df-test-cache"));
         set_var("XDG_DATA_HOME", Some("/tmp/df-test-data"));
         set_var("XDG_CONFIG_HOME", Some("/tmp/df-test-config"));
-        assert_eq!(cache_dir(), PathBuf::from("/tmp/df-test-cache/dragonfable"));
+        assert_eq!(cache_dir(), PathBuf::from("/tmp/df-test-cache/itmr-dragonfable-launcher"));
         assert_eq!(
             save_dir(),
-            PathBuf::from("/tmp/df-test-data/dragonfable/SharedObjects")
+            PathBuf::from("/tmp/df-test-data/itmr-dragonfable-launcher/SharedObjects")
         );
         assert_eq!(
             config_dir(),
-            PathBuf::from("/tmp/df-test-config/dragonfable")
+            PathBuf::from("/tmp/df-test-config/itmr-dragonfable-launcher")
         );
-        assert_eq!(log_dir(), PathBuf::from("/tmp/df-test-data/dragonfable/log"));
+        assert_eq!(log_dir(), PathBuf::from("/tmp/df-test-data/itmr-dragonfable-launcher/log"));
 
         set_var("XDG_CACHE_HOME", original_cache.as_deref());
         set_var("XDG_DATA_HOME", original_data.as_deref());
