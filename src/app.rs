@@ -26,20 +26,19 @@ use winit::window::{Window, WindowId};
 
 use crate::config::{self, State};
 use crate::input::{winit_input_to_ruffle_key_descriptor, winit_to_ruffle_text_control};
-use crate::log::{LogTab, SharedLogState, new_shared_log_state, parse_log_content};
+use crate::log::{LogDisplay, SharedLogState, new_shared_log_state};
+use crate::log_process::{LogProcess, LogProcessEvent};
+use crate::log_ui::{self, DEFAULT_PANEL_WIDTH, LogUiResponse};
 use crate::migration;
 use crate::player::{RuffleEvent, build_player, refetch_root_movie};
+use crate::theme::{self, APP_BACKGROUND};
 use crate::ui::{MigratedSource, Screen, initial_screen};
+use crate::GRAPHICS_BACKENDS;
 
-/// The wgpu backend family the app renders with. GL is used (not Vulkan)
-/// because the Vulkan backend currently has a memory leak in wgpu.
-const GRAPHICS_BACKENDS: wgpu::Backends = wgpu::Backends::GL;
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
-const APP_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(0x66, 0x00, 0x00);
 const LAUNCHER_BUTTON_SIZE: egui::Vec2 = egui::vec2(240.0, 42.0);
 const TOAST_DURATION: Duration = Duration::from_secs(3);
 const TOAST_FADE_DURATION: Duration = Duration::from_millis(450);
-const LOG_PANEL_WIDTH: f64 = 320.0;
 
 fn shutdown_runtime_bound<T>(
     resource: &mut Option<T>,
@@ -97,6 +96,9 @@ pub struct App {
     runtime: Option<tokio::runtime::Runtime>,
     /// Shared state for the external/side-by-side log display.
     log_state: SharedLogState,
+    log_display: LogDisplay,
+    log_process: Option<LogProcess>,
+    log_panel_width: f32,
 }
 
 impl App {
@@ -172,7 +174,7 @@ impl App {
 
         // egui setup (mirrors controller.rs:118-145).
         let egui_ctx = egui::Context::default();
-        configure_style(&egui_ctx);
+        theme::configure(&egui_ctx);
         let mut egui_winit = egui_winit::State::new(
             egui_ctx,
             ViewportId::ROOT,
@@ -220,7 +222,10 @@ impl App {
         let movie_size = Arc::new(Mutex::new(None));
         let root_error = Arc::new(Mutex::new(None));
 
-        let log_state = new_shared_log_state();
+        let log_event_loop = event_loop_proxy.clone();
+        let log_state = new_shared_log_state(move || {
+            let _ = log_event_loop.send_event(RuffleEvent::LogChanged);
+        });
         let mut app = Self {
             window: Some(window),
             event_loop: event_loop_proxy,
@@ -251,6 +256,9 @@ impl App {
             toast: None,
             runtime: Some(runtime),
             log_state,
+            log_display: LogDisplay::Hidden,
+            log_process: None,
+            log_panel_width: DEFAULT_PANEL_WIDTH,
         };
         if matches!(app.screen, Screen::Playing) {
             app.start_game();
@@ -267,6 +275,7 @@ impl App {
     }
 
     fn shutdown(&mut self) {
+        drop(self.log_process.take());
         shutdown_runtime_bound(&mut self.player, &mut self.runtime);
         drop(self.egui_renderer.take());
         drop(self.movie_target.take());
@@ -410,14 +419,26 @@ impl App {
         }
     }
 
-    fn movie_rect(&self) -> egui::Rect {
-        let size = (*self.movie_size.lock().unwrap()).unwrap_or((800, 600));
-        // egui positions and sizes are logical points (egui-winit divides by
-        // the scale factor), so the letterbox rect must come from the logical
-        // window size or the movie is drawn scale_factor× too large.
+    fn available_game_width(&self) -> f64 {
         let window = self.window.as_ref().expect("window exists");
         let logical = window.inner_size().to_logical::<f64>(window.scale_factor());
-        let available_width = available_game_width(logical.width, &self.log_state);
+        log_ui::available_game_width(
+            logical.width,
+            self.log_state.display(),
+            self.log_panel_width,
+        )
+    }
+
+    fn movie_rect(&self) -> egui::Rect {
+        self.movie_rect_with_width(self.available_game_width())
+    }
+
+    fn movie_rect_with_width(&self, available_width: f64) -> egui::Rect {
+        let size = (*self.movie_size.lock().unwrap()).unwrap_or((800, 600));
+        // egui positions and sizes are logical points, so the aspect-fit must
+        // use the window's logical height and the panel's logical width.
+        let window = self.window.as_ref().expect("window exists");
+        let logical = window.inner_size().to_logical::<f64>(window.scale_factor());
         movie_rect_for(size, (available_width, logical.height))
     }
 
@@ -430,17 +451,13 @@ impl App {
     }
 
     /// Keeps the renderer's viewport + the presented egui texture in sync with
-    /// the movie's physical on-screen size. Called once per frame before the
-    /// egui pass so window resizes also resize Ruffle's render target instead
-    /// of stretching a texture that remains at the SWF's native resolution.
-    fn update_movie_viewport(&mut self) {
+    /// the movie's physical on-screen size.
+    fn update_movie_viewport(&mut self, available_width: f64) {
         let movie_size = (*self.movie_size.lock().unwrap()).unwrap_or((800, 600));
         let window = self.window.as_ref().expect("window exists");
         let window_size = window.inner_size();
         let scale_factor = window.scale_factor();
-        // Use the same logical-point calculation as movie_rect() to stay in sync
         let logical = window_size.to_logical::<f64>(scale_factor);
-        let available_width = available_game_width(logical.width, &self.log_state);
         let rect = movie_rect_for(movie_size, (available_width, logical.height));
         // Convert logical rect to physical pixels for the renderer
         let viewport_size = (
@@ -485,9 +502,64 @@ impl App {
         self.movie_viewport_scale_factor = Some(scale_factor);
     }
 
+    fn ensure_log_process(&mut self) -> bool {
+        if self.log_process.is_some() {
+            return true;
+        }
+        match LogProcess::spawn(self.event_loop.clone()) {
+            Ok(process) => {
+                self.log_process = Some(process);
+                true
+            }
+            Err(error) => {
+                tracing::error!("Failed to start log process: {error}");
+                false
+            }
+        }
+    }
+
+    fn handle_log_change(&mut self) {
+        let previous_display = self.log_display;
+        let display = self.log_state.display();
+        match display {
+            LogDisplay::PopOut if self.ensure_log_process() => {
+                let snapshot = self.log_state.snapshot();
+                self.log_process
+                    .as_ref()
+                    .expect("log process exists")
+                    .update(snapshot);
+            }
+            LogDisplay::PopOut => self.log_state.hide(),
+            LogDisplay::Hidden | LogDisplay::SideBySide
+                if previous_display == LogDisplay::PopOut =>
+            {
+                if let Some(process) = &self.log_process {
+                    process.close();
+                }
+            }
+            LogDisplay::Hidden | LogDisplay::SideBySide => {}
+        }
+        if log_change_redraws_main(previous_display, display) {
+            self.window.as_ref().expect("window exists").request_redraw();
+        }
+        self.log_display = display;
+    }
+
+    fn handle_log_process_event(&mut self, event: LogProcessEvent) {
+        match event {
+            LogProcessEvent::Closed => self.log_state.hide(),
+            LogProcessEvent::TabSelected(tab) => self.log_state.set_tab(tab),
+            LogProcessEvent::Exited => {
+                self.log_process = None;
+                if self.log_state.display() == LogDisplay::PopOut {
+                    self.log_state.hide();
+                }
+            }
+        }
+    }
+
     fn render(&mut self, event_loop: &ActiveEventLoop) {
         let _runtime_guard = self.enter_runtime();
-        self.update_movie_viewport();
 
         let surface_texture = {
             let surface = self.surface.as_ref().expect("surface exists");
@@ -547,6 +619,7 @@ impl App {
         let launcher_open = self.launcher_open;
         let toast = self.toast.clone();
         let mut launcher_response = LauncherResponse::default();
+        let mut log_response = LogUiResponse::default();
         let full_output = egui_ctx.run(raw_input, |ctx| {
             match &self.screen {
                 Screen::Disclaimer => {
@@ -572,18 +645,37 @@ impl App {
                     }
                 }
                 Screen::Playing => {
+                    let window = self.window.as_ref().expect("window exists");
+                    let logical = window.inner_size().to_logical::<f64>(window.scale_factor());
+                    let mut launcher_right_inset = 0.0_f32;
+                    let available_width =
+                        if let Some(panel) = log_ui::side_panel(
+                            ctx,
+                            &self.log_state,
+                            self.log_panel_width,
+                        ) {
+                            self.log_panel_width = panel.width;
+                            launcher_right_inset = panel.width;
+                            log_response = panel.response;
+                            log_ui::available_game_width(
+                                logical.width,
+                                LogDisplay::SideBySide,
+                                panel.width,
+                            )
+                        } else {
+                            logical.width
+                        };
+
+                    self.update_movie_viewport(available_width);
                     if let Some(player) = &self.player {
-                        let mut player_lock = player.lock().unwrap();
-                        player_lock.render();
+                        player.lock().unwrap().render();
                     }
-                    // Render log panel first so it takes space from the available area
-                    log_panel_ui(ctx, &self.log_state);
                     if let Some(texture_id) = self.movie_texture_id {
                         egui::CentralPanel::default()
                             .frame(egui::Frame::NONE)
                             .show(ctx, |_ui| {
                                 let size = (*self.movie_size.lock().unwrap()).unwrap_or((800, 600));
-                                let rect = self.movie_rect();
+                                let rect = self.movie_rect_with_width(available_width);
                                 egui::Area::new(egui::Id::new("movie"))
                                     .fixed_pos(rect.min)
                                     .interactable(false)
@@ -604,6 +696,7 @@ impl App {
                         ctx,
                         fullscreen,
                         launcher_open,
+                        launcher_right_inset,
                     );
                 }
             }
@@ -611,6 +704,8 @@ impl App {
                 toast_ui(ctx, toast, now);
             }
         });
+
+        log_response.apply(&self.log_state);
 
         if let Some(open) = launcher_response.set_open {
             let changed = self.launcher_open != open;
@@ -794,6 +889,10 @@ impl App {
 /// texture has been registered yet (the SWF header may report a stage size
 /// equal to the placeholder, so a size mismatch alone would miss it) or the
 /// physical size/scale factor differs from the currently presented one.
+fn log_change_redraws_main(previous: LogDisplay, current: LogDisplay) -> bool {
+    previous == LogDisplay::SideBySide || current == LogDisplay::SideBySide
+}
+
 fn viewport_needs_update(
     movie_texture_id: Option<egui::TextureId>,
     movie_target_size: Option<(u32, u32)>,
@@ -861,13 +960,18 @@ impl ApplicationHandler<RuffleEvent> for App {
         match event {
             RuffleEvent::TaskPoll(runnable) => {
                 runnable.run();
+                self.window.as_ref().expect("window exists").request_redraw();
             }
+            RuffleEvent::LogChanged => self.handle_log_change(),
+            RuffleEvent::LogProcess(event) => self.handle_log_process_event(event),
         }
-        self.window.as_ref().expect("window exists").request_redraw();
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let _runtime_guard = self.enter_runtime();
+        if self.window.as_ref().is_none_or(|window| window.id() != id) {
+            return;
+        }
         if let WindowEvent::RedrawRequested = &event {
             if !self.minimized {
                 self.render(event_loop);
@@ -1199,17 +1303,23 @@ fn launcher_menu_button(
     response
 }
 
+fn launcher_right_offset(right_inset: f32) -> f32 {
+    -12.0_f32 - right_inset
+}
+
 fn launcher_ui(
     ctx: &egui::Context,
     fullscreen: bool,
     open: bool,
+    right_inset: f32,
 ) -> LauncherResponse {
     use egui::{Align2, Color32, CornerRadius, Frame, Margin, Order, Stroke};
 
     let mut output = LauncherResponse::default();
+    let right_offset = launcher_right_offset(right_inset);
 
     let trigger = egui::Area::new(egui::Id::new("launcher_trigger"))
-        .anchor(Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+        .anchor(Align2::RIGHT_TOP, egui::vec2(right_offset, 12.0))
         .order(Order::Foreground)
         .show(ctx, launcher_trigger);
     output.hit_regions.trigger = Some(trigger.response.rect);
@@ -1220,7 +1330,7 @@ fn launcher_ui(
     let mut popover_rect = None;
     if open {
         let popover = egui::Area::new(egui::Id::new("launcher_popover"))
-            .anchor(Align2::RIGHT_TOP, egui::vec2(-12.0, 50.0))
+            .anchor(Align2::RIGHT_TOP, egui::vec2(right_offset, 50.0))
             .order(Order::Foreground)
             .show(ctx, |ui| {
                 Frame::new()
@@ -1310,138 +1420,6 @@ fn toast_ui(ctx: &egui::Context, toast: &Toast, now: Instant) {
                     );
                 });
         });
-}
-
-/// Renders the log panel for side-by-side mode.
-fn log_panel_ui(ctx: &egui::Context, log_state: &SharedLogState) {
-    use egui::{Color32, Frame, Margin, ScrollArea, Stroke};
-
-    let state = match log_state.lock() {
-        Ok(state) => state.clone(),
-        Err(_) => return,
-    };
-
-    if !state.visible {
-        return;
-    }
-
-    egui::SidePanel::right("log_panel")
-        .exact_width(LOG_PANEL_WIDTH as f32)
-        .frame(
-            Frame::new()
-                .fill(Color32::from_rgba_unmultiplied(0x1A, 0x04, 0x04, 245))
-                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0x8D, 0x5E, 0x2F)))
-                .inner_margin(Margin::symmetric(8, 8)),
-        )
-        .show(ctx, |ui| {
-            // Tab buttons
-            ui.horizontal(|ui| {
-                let game_selected = state.tab == LogTab::Game;
-                let battle_selected = state.tab == LogTab::Battle;
-
-                let game_tab_text = if game_selected {
-                    egui::RichText::new("Game Log").strong().color(Color32::from_rgb(0xFF, 0xF0, 0xD0))
-                } else {
-                    egui::RichText::new("Game Log")
-                };
-                let battle_tab_text = if battle_selected {
-                    egui::RichText::new("Battle Log").strong().color(Color32::from_rgb(0xFF, 0xF0, 0xD0))
-                } else {
-                    egui::RichText::new("Battle Log")
-                };
-
-                let game_btn = ui.add(egui::Button::new(game_tab_text).selected(game_selected));
-                let battle_btn = ui.add(egui::Button::new(battle_tab_text).selected(battle_selected));
-
-                if game_btn.clicked() && let Ok(mut s) = log_state.lock() {
-                    s.tab = LogTab::Game;
-                }
-                if battle_btn.clicked() && let Ok(mut s) = log_state.lock() {
-                    s.tab = LogTab::Battle;
-                }
-            });
-
-            ui.separator();
-
-            // Log content
-            let content = match state.tab {
-                LogTab::Game => &state.game_log,
-                LogTab::Battle => &state.battle_log,
-            };
-
-            ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    // Parse HTML color tags and render with proper colors
-                    let fragments = parse_log_content(content);
-                    let default_color = Color32::from_rgb(0xF4, 0xE8, 0xD0);
-                    
-                    for fragment in &fragments {
-                        let color = fragment.color
-                            .map(|c| Color32::from_rgb(c[0], c[1], c[2]))
-                            .unwrap_or(default_color);
-                        
-                        ui.label(
-                            egui::RichText::new(&fragment.text)
-                                .color(color)
-                                .monospace()
-                                .size(12.0),
-                        );
-                    }
-                });
-        });
-}
-
-/// Returns the available window width for the game when the log panel is visible.
-fn available_game_width(window_width: f64, log_state: &SharedLogState) -> f64 {
-    let show_panel = log_state.lock().map(|s| s.visible).unwrap_or(false);
-    if show_panel {
-        (window_width - LOG_PANEL_WIDTH).max(100.0)
-    } else {
-        window_width
-    }
-}
-
-fn configure_style(ctx: &egui::Context) {
-    use egui::{Color32, CornerRadius, FontId, Stroke, TextStyle};
-
-    let ivory = Color32::from_rgb(0xF4, 0xE8, 0xD0);
-    let bronze = Color32::from_rgb(0xC0, 0x8A, 0x47);
-    let mut style = (*ctx.style()).clone();
-    style.visuals = egui::Visuals::dark();
-    style.visuals.override_text_color = Some(ivory);
-    style.visuals.panel_fill = APP_BACKGROUND;
-    style.visuals.window_fill = APP_BACKGROUND;
-    style.visuals.extreme_bg_color = Color32::from_rgb(0x38, 0x08, 0x08);
-    style.visuals.faint_bg_color = Color32::from_rgb(0x5A, 0x00, 0x00);
-    style.visuals.selection.bg_fill = bronze;
-    style.visuals.selection.stroke = Stroke::new(1.0_f32, ivory);
-
-    style.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(0x3E, 0x0B, 0x0B);
-    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(0x3E, 0x0B, 0x0B);
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, bronze);
-    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, ivory);
-    style.visuals.widgets.inactive.corner_radius = CornerRadius::same(5);
-
-    style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x86, 0x18, 0x18);
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x86, 0x18, 0x18);
-    style.visuals.widgets.hovered.bg_stroke =
-        Stroke::new(1.5_f32, Color32::from_rgb(0xE2, 0xB8, 0x70));
-    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
-    style.visuals.widgets.hovered.corner_radius = CornerRadius::same(5);
-
-    style.visuals.widgets.active.weak_bg_fill = Color32::from_rgb(0x2B, 0x06, 0x06);
-    style.visuals.widgets.active.bg_fill = Color32::from_rgb(0x2B, 0x06, 0x06);
-    style.visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, bronze);
-    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
-    style.visuals.widgets.active.corner_radius = CornerRadius::same(5);
-
-    style.spacing.button_padding = egui::vec2(16.0, 9.0);
-    style.text_styles.insert(TextStyle::Heading, FontId::proportional(30.0));
-    style.text_styles.insert(TextStyle::Body, FontId::proportional(16.0));
-    style.text_styles.insert(TextStyle::Button, FontId::proportional(16.0));
-    ctx.set_style(style);
 }
 
 fn launcher_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
@@ -1709,6 +1687,30 @@ mod tests {
     }
 
     #[test]
+    fn hidden_and_pop_out_log_updates_do_not_redraw_the_main_window() {
+        assert!(!log_change_redraws_main(
+            LogDisplay::Hidden,
+            LogDisplay::Hidden
+        ));
+        assert!(!log_change_redraws_main(
+            LogDisplay::PopOut,
+            LogDisplay::PopOut
+        ));
+    }
+
+    #[test]
+    fn entering_or_leaving_side_by_side_redraws_the_main_window() {
+        assert!(log_change_redraws_main(
+            LogDisplay::Hidden,
+            LogDisplay::SideBySide
+        ));
+        assert!(log_change_redraws_main(
+            LogDisplay::SideBySide,
+            LogDisplay::PopOut
+        ));
+    }
+
+    #[test]
     fn viewport_needs_update_when_no_texture_registered_even_if_sizes_match() {
         assert!(viewport_needs_update(
             None,
@@ -1836,6 +1838,12 @@ mod tests {
         let (x, _) =
             window_to_movie_viewport_for(PhysicalPosition::new(240.0, 0.0), &rect, 1.5);
         assert!(x.abs() < 1e-3);
+    }
+
+    #[test]
+    fn launcher_moves_left_of_the_side_panel() {
+        assert_eq!(launcher_right_offset(0.0_f32), -12.0_f32);
+        assert_eq!(launcher_right_offset(320.0_f32), -332.0_f32);
     }
 
     #[test]

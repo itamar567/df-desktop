@@ -1,44 +1,188 @@
 //! Log callback implementation and log display using LocalConnection.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use ruffle_core::local_connection::{LocalConnectionListener, LocalConnectionMessage};
+use serde::{Deserialize, Serialize};
 
-/// Represents the mode for displaying logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LogMode {
+enum LogMode {
     #[default]
     Disabled,
     SideBySide,
     PopOut,
 }
 
-/// Represents which log tab is currently active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogDisplay {
+    #[default]
+    Hidden,
+    SideBySide,
+    PopOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LogTab {
     #[default]
     Game,
     Battle,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct LogState {
-    pub mode: LogMode,
-    pub visible: bool,
+#[derive(Debug, Default)]
+struct LogState {
+    mode: LogMode,
+    visible: bool,
+    tab: LogTab,
+    game_log: String,
+    battle_log: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogSnapshot {
     pub tab: LogTab,
-    pub game_log: String,
-    pub battle_log: String,
+    pub content: String,
 }
 
-/// Thread-safe wrapper for log state.
-pub type SharedLogState = Arc<Mutex<LogState>>;
-
-/// Creates a new shared log state.
-pub fn new_shared_log_state() -> SharedLogState {
-    Arc::new(Mutex::new(LogState::default()))
+#[derive(Clone)]
+pub struct SharedLogState {
+    state: Arc<Mutex<LogState>>,
+    on_change: Arc<dyn Fn() + Send + Sync>,
 }
 
-/// Listener that captures LocalConnection messages for the log.
+impl SharedLogState {
+    fn new(on_change: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(LogState::default())),
+            on_change: Arc::new(on_change),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, LogState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn update(&self, update: impl FnOnce(&mut LogState) -> bool) {
+        let changed = {
+            let mut state = self.state();
+            update(&mut state)
+        };
+        if changed {
+            (self.on_change)();
+        }
+    }
+
+    pub fn display(&self) -> LogDisplay {
+        let state = self.state();
+        if !state.visible {
+            LogDisplay::Hidden
+        } else {
+            match state.mode {
+                LogMode::SideBySide => LogDisplay::SideBySide,
+                LogMode::PopOut => LogDisplay::PopOut,
+                LogMode::Disabled => LogDisplay::Hidden,
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> LogSnapshot {
+        let state = self.state();
+        let content = match state.tab {
+            LogTab::Game => state.game_log.clone(),
+            LogTab::Battle => state.battle_log.clone(),
+        };
+        LogSnapshot {
+            tab: state.tab,
+            content,
+        }
+    }
+
+    pub fn replace(&self, snapshot: LogSnapshot) {
+        self.update(|state| {
+            let tab_changed = state.tab != snapshot.tab;
+            state.tab = snapshot.tab;
+            let content_changed = match snapshot.tab {
+                LogTab::Game => replace_if_changed(&mut state.game_log, snapshot.content),
+                LogTab::Battle => replace_if_changed(&mut state.battle_log, snapshot.content),
+            };
+            tab_changed || content_changed
+        });
+    }
+
+    pub fn set_game_log(&self, content: String) {
+        self.update(|state| replace_if_changed(&mut state.game_log, content));
+    }
+
+    pub fn set_battle_log(&self, content: String) {
+        self.update(|state| replace_if_changed(&mut state.battle_log, content));
+    }
+
+    pub fn set_tab(&self, tab: LogTab) {
+        self.update(|state| {
+            let changed = state.tab != tab;
+            state.tab = tab;
+            changed
+        });
+    }
+
+    pub fn toggle_tab(&self) {
+        self.update(|state| {
+            state.tab = match state.tab {
+                LogTab::Game => LogTab::Battle,
+                LogTab::Battle => LogTab::Game,
+            };
+            true
+        });
+    }
+
+    pub fn hide(&self) {
+        self.update(|state| {
+            let changed = state.visible;
+            state.visible = false;
+            changed
+        });
+    }
+
+    fn apply(&self, command: LogCommand) {
+        self.update(|state| {
+            let previous = (state.mode, state.visible);
+            match command {
+                LogCommand::ToggleSbS => {
+                    state.mode = LogMode::SideBySide;
+                    state.visible = !state.visible;
+                }
+                LogCommand::ToggleEx => {
+                    state.mode = LogMode::PopOut;
+                    state.visible = !state.visible;
+                }
+                LogCommand::HideLog => state.visible = false,
+                LogCommand::ToggleView => match state.mode {
+                    LogMode::SideBySide => state.mode = LogMode::PopOut,
+                    LogMode::PopOut => state.mode = LogMode::SideBySide,
+                    LogMode::Disabled => {}
+                },
+            }
+            previous != (state.mode, state.visible)
+        });
+    }
+}
+
+fn replace_if_changed(target: &mut String, replacement: String) -> bool {
+    if *target == replacement {
+        false
+    } else {
+        *target = replacement;
+        true
+    }
+}
+
+pub fn new_shared_log_state(
+    on_change: impl Fn() + Send + Sync + 'static,
+) -> SharedLogState {
+    SharedLogState::new(on_change)
+}
+
 pub struct LogListener {
     state: SharedLogState,
 }
@@ -51,9 +195,13 @@ impl LogListener {
 
 impl LocalConnectionListener for LogListener {
     fn on_message(&self, message: &LocalConnectionMessage) {
-        tracing::debug!("LocalConnection: channel={}, method={}, arg_count={}", message.channel, message.method, message.arguments.len());
-        
-        // Only handle messages to the "df_log" channel
+        tracing::debug!(
+            "LocalConnection: channel={}, method={}, arg_count={}",
+            message.channel,
+            message.method,
+            message.arguments.len()
+        );
+
         if !message.channel.ends_with(":df_log") && message.channel != "df_log" {
             return;
         }
@@ -61,69 +209,28 @@ impl LocalConnectionListener for LogListener {
         match message.method.as_str() {
             "swapGameLog" => {
                 if let Some(content) = message.arguments.first() {
-                    if let Ok(mut state) = self.state.lock() {
-                        state.game_log = content.clone();
-                    }
+                    self.state.set_game_log(content.clone());
                 }
             }
             "swapBattleLog" => {
                 if let Some(content) = message.arguments.first() {
-                    if let Ok(mut state) = self.state.lock() {
-                        state.battle_log = content.clone();
-                    }
+                    self.state.set_battle_log(content.clone());
                 }
             }
-            "resetLogs" => {
-                tracing::debug!("Ignoring resetLogs request");
-            }
-            "logSwap" => {
-                if let Ok(mut state) = self.state.lock() {
-                    let new_tab = if state.tab == LogTab::Game {
-                        LogTab::Battle
-                    } else {
-                        LogTab::Game
-                    };
-                    state.tab = new_tab;
-                }
-            }
-            _ => {
-                tracing::warn!("Unknown df_log method: {}", message.method);
-            }
+            "resetLogs" => tracing::debug!("Ignoring resetLogs request"),
+            "logSwap" => self.state.toggle_tab(),
+            _ => tracing::warn!("Unknown df_log method: {}", message.method),
         }
     }
 }
 
-/// Handles `javascript:` log URLs from the SWF.
 pub fn handle_javascript_url(url: &str, log_state: &SharedLogState) -> bool {
     let Some(command) = parse_javascript_url(url) else {
         return false;
     };
 
     tracing::debug!("Log command: {command:?}");
-
-    if let Ok(mut state) = log_state.lock() {
-        match command {
-            LogCommand::ToggleSbS => {
-                state.mode = LogMode::SideBySide;
-                state.visible = !state.visible;
-            }
-            LogCommand::ToggleEx => {
-                state.mode = LogMode::PopOut;
-                state.visible = !state.visible;
-            }
-            LogCommand::HideLog => {
-                state.visible = false;
-            }
-            LogCommand::ToggleView => {
-                if matches!(state.mode, LogMode::PopOut) {
-                    state.mode = LogMode::SideBySide;
-                } else if matches!(state.mode, LogMode::SideBySide) {
-                    state.mode = LogMode::PopOut;
-                }
-            }
-        }
-    }
-
+    log_state.apply(command);
     true
 }
 
@@ -346,4 +453,139 @@ fn remap_for_dark_bg(color: [u8; 3], min_lightness: f32, lightness_gamma: f32, s
         (g * 255.0).round().clamp(0.0, 255.0) as u8,
         (b * 255.0).round().clamp(0.0, 255.0) as u8,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    fn logs() -> (SharedLogState, Arc<AtomicUsize>) {
+        let changes = Arc::new(AtomicUsize::new(0));
+        let observed_changes = changes.clone();
+        let logs = new_shared_log_state(move || {
+            observed_changes.fetch_add(1, Ordering::Relaxed);
+        });
+        (logs, changes)
+    }
+
+    #[test]
+    fn side_by_side_command_opens_and_closes_the_side_panel() {
+        let (logs, _) = logs();
+
+        assert!(handle_javascript_url("javascript:toggleSbS();", &logs));
+        assert_eq!(logs.display(), LogDisplay::SideBySide);
+
+        assert!(handle_javascript_url("javascript:toggleSbS();", &logs));
+        assert_eq!(logs.display(), LogDisplay::Hidden);
+    }
+
+    #[test]
+    fn pop_out_command_opens_and_closes_the_pop_out() {
+        let (logs, _) = logs();
+
+        assert!(handle_javascript_url("javascript:toggleEx();", &logs));
+        assert_eq!(logs.display(), LogDisplay::PopOut);
+
+        assert!(handle_javascript_url("javascript:toggleEx();", &logs));
+        assert_eq!(logs.display(), LogDisplay::Hidden);
+    }
+
+    #[test]
+    fn hiding_the_pop_out_preserves_its_mode() {
+        let (logs, _) = logs();
+        handle_javascript_url("javascript:toggleEx();", &logs);
+
+        logs.hide();
+        assert_eq!(logs.display(), LogDisplay::Hidden);
+
+        handle_javascript_url("javascript:toggleEx();", &logs);
+        assert_eq!(logs.display(), LogDisplay::PopOut);
+    }
+
+    #[test]
+    fn toggle_view_moves_a_visible_log_between_windows() {
+        let (logs, _) = logs();
+        handle_javascript_url("javascript:toggleSbS();", &logs);
+
+        handle_javascript_url("javascript:toggleView();", &logs);
+        assert_eq!(logs.display(), LogDisplay::PopOut);
+
+        handle_javascript_url("javascript:toggleView();", &logs);
+        assert_eq!(logs.display(), LogDisplay::SideBySide);
+    }
+
+    #[test]
+    fn toggle_view_does_nothing_before_a_view_is_selected() {
+        let (logs, changes) = logs();
+
+        assert!(handle_javascript_url("javascript:toggleView();", &logs));
+
+        assert_eq!(logs.display(), LogDisplay::Hidden);
+        assert_eq!(changes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn hide_command_closes_the_visible_log() {
+        let (logs, _) = logs();
+        handle_javascript_url("javascript:toggleSbS();", &logs);
+
+        assert!(handle_javascript_url("javascript:hideLog();", &logs));
+
+        assert_eq!(logs.display(), LogDisplay::Hidden);
+    }
+
+    #[test]
+    fn unrelated_javascript_url_is_not_handled() {
+        let (logs, changes) = logs();
+
+        assert!(!handle_javascript_url("javascript:other();", &logs));
+        assert_eq!(changes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn mutations_notify_only_when_state_changes() {
+        let (logs, changes) = logs();
+
+        logs.set_game_log("first".to_string());
+        logs.set_game_log("first".to_string());
+        logs.set_tab(LogTab::Game);
+        logs.set_tab(LogTab::Battle);
+        logs.hide();
+
+        assert_eq!(changes.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn replacing_log_data_updates_the_selected_log_and_tab() {
+        let (logs, changes) = logs();
+
+        logs.replace(LogSnapshot {
+            tab: LogTab::Battle,
+            content: "battle".to_string(),
+        });
+
+        assert_eq!(
+            logs.snapshot(),
+            LogSnapshot {
+                tab: LogTab::Battle,
+                content: "battle".to_string(),
+            }
+        );
+        assert_eq!(changes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn snapshot_contains_only_the_selected_log() {
+        let (logs, _) = logs();
+        logs.set_game_log("game".to_string());
+        logs.set_battle_log("battle".to_string());
+        logs.set_tab(LogTab::Battle);
+
+        let snapshot = logs.snapshot();
+
+        assert_eq!(snapshot.tab, LogTab::Battle);
+        assert_eq!(snapshot.content, "battle");
+    }
 }

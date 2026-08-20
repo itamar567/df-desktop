@@ -32,6 +32,8 @@ use dragonfable_cache::{CacheHandle, Config, DragonFableCachingNavigator};
 /// Events the winit event loop processes for us.
 pub enum RuffleEvent {
     TaskPoll(async_task::Runnable<()>),
+    LogChanged,
+    LogProcess(crate::log_process::LogProcessEvent),
 }
 
 /// A bare-bones executor that schedules futures on the winit event loop,
