@@ -451,8 +451,9 @@ impl App {
     }
 
     /// Keeps the renderer's viewport + the presented egui texture in sync with
-    /// the movie's physical on-screen size.
-    fn update_movie_viewport(&mut self, available_width: f64) {
+    /// the movie's physical on-screen size. Returns whether the viewport
+    /// changed (and therefore the next frame must be re-rendered).
+    fn update_movie_viewport(&mut self, available_width: f64) -> bool {
         let movie_size = (*self.movie_size.lock().unwrap()).unwrap_or((800, 600));
         let window = self.window.as_ref().expect("window exists");
         let window_size = window.inner_size();
@@ -465,7 +466,7 @@ impl App {
             (rect.height() * scale_factor as f32).round().max(1.0) as u32,
         );
         let Some(player) = &self.player else {
-            return;
+            return false;
         };
         if !viewport_needs_update(
             self.movie_texture_id,
@@ -476,7 +477,7 @@ impl App {
             viewport_size,
             scale_factor,
         ) {
-            return;
+            return false;
         }
         let mut player_lock = player.lock().unwrap();
         player_lock.set_viewport_dimensions(ViewportDimensions {
@@ -500,6 +501,7 @@ impl App {
             buffer: None,
         });
         self.movie_viewport_scale_factor = Some(scale_factor);
+        true
     }
 
     fn ensure_log_process(&mut self) -> bool {
@@ -666,9 +668,15 @@ impl App {
                             logical.width
                         };
 
-                    self.update_movie_viewport(available_width);
+                    let viewport_changed = self.update_movie_viewport(available_width);
                     if let Some(player) = &self.player {
-                        player.lock().unwrap().render();
+                        // Re-encoding and submitting the movie is expensive; egui-only
+                        // redraws (hover, toasts, input events) must reuse the last
+                        // submitted movie texture instead of resubmitting it.
+                        let mut player_lock = player.lock().unwrap();
+                        if viewport_changed || player_lock.needs_render() {
+                            player_lock.render();
+                        }
                     }
                     if let Some(texture_id) = self.movie_texture_id {
                         egui::CentralPanel::default()
