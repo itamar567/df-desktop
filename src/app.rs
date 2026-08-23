@@ -1508,42 +1508,29 @@ fn launcher_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui
     ui.add(egui::Button::new(text).min_size(LAUNCHER_BUTTON_SIZE))
 }
 
-fn centered_screen(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
-    let available = ui.available_rect_before_wrap();
-    let content_rect = egui::Rect::from_center_size(
-        available.center(),
-        egui::vec2(available.width().min(560.0), available.height()),
-    );
-    ui.scope_builder(
-        egui::UiBuilder::new()
-            .max_rect(content_rect)
-            .layout(
-                egui::Layout::top_down(egui::Align::Center)
-                    .with_main_align(egui::Align::Center),
-            ),
-        add_contents,
-    );
-}
-
 // Pure egui widgets for the overlay screens. (These live in app.rs for now;
 // they are the designated growth point for future settings UI.)
 fn disclaimer_ui(ctx: &egui::Context) -> bool {
     let mut continue_clicked = false;
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(APP_BACKGROUND))
-        .show(ctx, |ui| {
-            centered_screen(ui, |ui| {
-                ui.heading("Disclaimer");
-                ui.add_space(24.0);
-                ui.add(egui::Label::new(
-                    "This is a 3rd party launcher that is not supported nor endorsed by Artix Entertainment.",
-                ).wrap());
-                ui.label("By clicking 'Continue', you agree to use this launcher at your own risk.");
-                ui.add_space(32.0);
-                if launcher_button(ui, "Continue").clicked() {
-                    continue_clicked = true;
-                }
-            });
+        .show(ctx, |_ui| {
+            egui::Area::new(egui::Id::new("disclaimer"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("Disclaimer");
+                        ui.add_space(24.0);
+                        ui.add(egui::Label::new(
+                            "This is a 3rd party launcher that is not supported nor endorsed by Artix Entertainment.",
+                        ).wrap());
+                        ui.label("By clicking 'Continue', you agree to use this launcher at your own risk.");
+                        ui.add_space(32.0);
+                        if launcher_button(ui, "Continue").clicked() {
+                            continue_clicked = true;
+                        }
+                    });
+                });
         });
     continue_clicked
 }
@@ -1552,24 +1539,28 @@ fn setup_ui(ctx: &egui::Context, sources: &[MigratedSource]) -> Option<Option<us
     let mut choice = None;
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(APP_BACKGROUND))
-        .show(ctx, |ui| {
-            centered_screen(ui, |ui| {
-                ui.heading("Save data found");
-                ui.add_space(16.0);
-                ui.label("We found save data from another DragonFable launcher.");
-                ui.label("Would you like to copy it into DragonFable?");
-                ui.add_space(24.0);
-                for (index, source) in sources.iter().enumerate() {
-                    if launcher_button(ui, format!("Copy from {}", source.name)).clicked() {
-                        choice = Some(Some(index));
-                    }
-                    ui.add_space(8.0);
-                }
-                ui.add_space(4.0);
-                if launcher_button(ui, "Don't copy").clicked() {
-                    choice = Some(None);
-                }
-            });
+        .show(ctx, |_ui| {
+            egui::Area::new(egui::Id::new("setup"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("Save data found");
+                        ui.add_space(16.0);
+                        ui.label("We found save data from another DragonFable launcher.");
+                        ui.label("Would you like to copy it into DragonFable?");
+                        ui.add_space(24.0);
+                        for (index, source) in sources.iter().enumerate() {
+                            if launcher_button(ui, format!("Copy from {}", source.name)).clicked() {
+                                choice = Some(Some(index));
+                            }
+                            ui.add_space(8.0);
+                        }
+                        ui.add_space(4.0);
+                        if launcher_button(ui, "Don't copy").clicked() {
+                            choice = Some(None);
+                        }
+                    });
+                });
         });
     choice
 }
@@ -1596,26 +1587,30 @@ fn error_ui_with_geometry(
     let mut buttons = Vec::new();
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(APP_BACKGROUND))
-        .show(ctx, |ui| {
-            centered_screen(ui, |ui| {
-                ui.heading("Failed to load DragonFable");
-                ui.add_space(16.0);
-                ui.add(egui::Label::new(message).wrap());
-                ui.add_space(24.0);
-                if can_retry {
-                    let response = launcher_button(ui, "Retry");
-                    if response.clicked() {
-                        action = Some(ErrorAction::Retry);
-                    }
-                    buttons.push((ErrorAction::Retry, response.rect));
-                    ui.add_space(8.0);
-                }
-                let response = launcher_button(ui, "Quit");
-                if response.clicked() {
-                    action = Some(ErrorAction::Quit);
-                }
-                buttons.push((ErrorAction::Quit, response.rect));
-            });
+        .show(ctx, |_ui| {
+            egui::Area::new(egui::Id::new("error"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("Failed to load DragonFable");
+                        ui.add_space(16.0);
+                        ui.add(egui::Label::new(message).wrap());
+                        ui.add_space(24.0);
+                        if can_retry {
+                            let response = launcher_button(ui, "Retry");
+                            if response.clicked() {
+                                action = Some(ErrorAction::Retry);
+                            }
+                            buttons.push((ErrorAction::Retry, response.rect));
+                            ui.add_space(8.0);
+                        }
+                        let response = launcher_button(ui, "Quit");
+                        if response.clicked() {
+                            action = Some(ErrorAction::Quit);
+                        }
+                        buttons.push((ErrorAction::Quit, response.rect));
+                    });
+                });
         });
     (action, buttons)
 }
@@ -1623,10 +1618,14 @@ fn error_ui_with_geometry(
 fn loading_ui(ctx: &egui::Context) {
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(APP_BACKGROUND))
-        .show(ctx, |ui| {
-            centered_screen(ui, |ui| {
-                ui.label("Loading DragonFable…");
-            });
+        .show(ctx, |_ui| {
+            egui::Area::new(egui::Id::new("loading"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label("Loading DragonFable…");
+                    });
+                });
         });
 }
 
