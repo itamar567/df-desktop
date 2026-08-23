@@ -34,6 +34,7 @@ pub enum RuffleEvent {
     TaskPoll(async_task::Runnable<()>),
     LogChanged,
     LogProcess(crate::log_process::LogProcessEvent),
+    UpdateAvailable(crate::update::AvailableUpdate),
 }
 
 /// A bare-bones executor that schedules futures on the winit event loop,

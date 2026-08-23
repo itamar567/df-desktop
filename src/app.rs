@@ -33,6 +33,7 @@ use crate::migration;
 use crate::player::{RuffleEvent, build_player, refetch_root_movie};
 use crate::theme::{self, APP_BACKGROUND};
 use crate::ui::{MigratedSource, Screen, initial_screen};
+use crate::update::{self, AvailableUpdate};
 use crate::GRAPHICS_BACKENDS;
 
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -90,6 +91,8 @@ pub struct App {
     launcher_pointer_over: bool,
     launcher_pointer_captured: bool,
     toast: Option<Toast>,
+    /// A newer GitHub release, once the startup update check finds one.
+    available_update: Option<AvailableUpdate>,
     /// Tokio runtime whose context must be entered whenever ruffle futures are
     /// polled or player methods may touch the navigator (ruffle's backend uses
     /// `tokio::spawn` directly, which panics without an entered runtime).
@@ -106,6 +109,7 @@ impl App {
         let runtime = tokio::runtime::Runtime::new()?;
         let _runtime_guard = runtime.enter();
         let event_loop_proxy = event_loop.create_proxy();
+        spawn_update_check(event_loop_proxy.clone());
 
         // Creating the window up front (rather than in `new_events(Init)`)
         // keeps the whole app in one place; `EventLoop::create_window` is
@@ -115,7 +119,8 @@ impl App {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("DragonFable")
+                        .with_title("itmr's DragonFable Launcher")
+                        .with_window_icon(window_icon())
                         .with_inner_size(PhysicalSize::new(1280, 800)),
                 )
                 .context("window creation failed")?,
@@ -254,6 +259,7 @@ impl App {
             launcher_pointer_over: false,
             launcher_pointer_captured: false,
             toast: None,
+            available_update: None,
             runtime: Some(runtime),
             log_state,
             log_display: LogDisplay::Hidden,
@@ -372,12 +378,26 @@ impl App {
         match action {
             LauncherAction::ToggleFullscreen => self.toggle_fullscreen(),
             LauncherAction::ClearCache => self.clear_game_cache(),
+            LauncherAction::DownloadUpdate => self.open_update_download(),
         }
         self.launcher_open = false;
         self.window
             .as_ref()
             .expect("window exists")
             .request_redraw();
+    }
+
+    fn open_update_download(&mut self) {
+        let Some(update) = &self.available_update else {
+            return;
+        };
+        let url = update.url.clone();
+        if let Err(error) = webbrowser::open(&url) {
+            tracing::error!("Could not open download page {url}: {error}");
+            self.show_toast("Could not open the download page");
+            return;
+        }
+        self.show_toast("Opening the download page…");
     }
 
     fn pointer_is_over_launcher(&self, position: PhysicalPosition<f64>) -> bool {
@@ -705,6 +725,7 @@ impl App {
                         fullscreen,
                         launcher_open,
                         launcher_right_inset,
+                        self.available_update.as_ref(),
                     );
                 }
             }
@@ -972,6 +993,12 @@ impl ApplicationHandler<RuffleEvent> for App {
             }
             RuffleEvent::LogChanged => self.handle_log_change(),
             RuffleEvent::LogProcess(event) => self.handle_log_process_event(event),
+            RuffleEvent::UpdateAvailable(update) => {
+                tracing::info!("New version available: {} ({})", update.version, update.url);
+                self.available_update = Some(update.clone());
+                self.show_toast(format!("New version {} available", update.version));
+                self.window.as_ref().expect("window exists").request_redraw();
+            }
         }
     }
 
@@ -1214,6 +1241,22 @@ impl Toast {
 enum LauncherAction {
     ToggleFullscreen,
     ClearCache,
+    DownloadUpdate,
+}
+
+/// Fires one startup update check; the result arrives as an
+/// [`RuffleEvent::UpdateAvailable`]. Failures are logged and silently ignored:
+/// being offline must never block or bother the user.
+fn spawn_update_check(event_loop: EventLoopProxy<RuffleEvent>) {
+    tokio::spawn(async move {
+        match update::check().await {
+            Ok(Some(update)) => {
+                let _ = event_loop.send_event(RuffleEvent::UpdateAvailable(update));
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!("Update check failed: {error:#}"),
+        }
+    });
 }
 
 #[derive(Debug, Default)]
@@ -1320,6 +1363,7 @@ fn launcher_ui(
     fullscreen: bool,
     open: bool,
     right_inset: f32,
+    available_update: Option<&AvailableUpdate>,
 ) -> LauncherResponse {
     use egui::{Align2, Color32, CornerRadius, Frame, Margin, Order, Stroke};
 
@@ -1362,6 +1406,18 @@ fn launcher_ui(
                         ui.add_space(5.0);
                         if launcher_menu_button(ui, "Clear cache", None).clicked() {
                             return Some(LauncherAction::ClearCache);
+                        }
+                        if let Some(update) = available_update {
+                            ui.add_space(5.0);
+                            if launcher_menu_button(
+                                ui,
+                                &format!("Download v{}", update.version),
+                                None,
+                            )
+                            .clicked()
+                            {
+                                return Some(LauncherAction::DownloadUpdate);
+                            }
                         }
                         None
                     })
@@ -1428,6 +1484,24 @@ fn toast_ui(ctx: &egui::Context, toast: &Toast, now: Instant) {
                     );
                 });
         });
+}
+
+/// The app icon for the window / taskbar, decoded from the packaged PNG.
+/// `None` only if the bundled icon were ever unreadable; the app still runs.
+fn window_icon() -> Option<winit::window::Icon> {
+    let (rgba, width, height) = decode_window_icon()?;
+    winit::window::Icon::from_rgba(rgba, width, height).ok()
+}
+
+/// Decodes the bundled PNG into the flat RGBA buffer winit expects.
+fn decode_window_icon() -> Option<(Vec<u8>, u32, u32)> {
+    let image = image::load_from_memory(include_bytes!(
+        "../packaging/itmr-dragonfable-launcher.png",
+    ))
+        .ok()?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    Some((image.into_raw(), width, height))
 }
 
 fn launcher_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
@@ -1879,6 +1953,13 @@ mod tests {
         let fading = now + TOAST_DURATION - Duration::from_millis(100);
         assert!(toast.opacity(fading) > 0.0 && toast.opacity(fading) < 1.0);
         assert!(toast.expired(now + TOAST_DURATION));
+    }
+
+    #[test]
+    fn bundled_icon_decodes_to_a_square_rgba_image() {
+        let (rgba, width, height) = decode_window_icon().expect("bundled icon must decode");
+        assert!(width > 0 && width == height);
+        assert_eq!(rgba.len(), (width * height * 4) as usize);
     }
 
     #[test]

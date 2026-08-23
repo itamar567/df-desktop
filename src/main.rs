@@ -12,6 +12,7 @@ mod navigator;
 mod player;
 mod theme;
 mod ui;
+mod update;
 
 /// GL avoids the Vulkan memory leak currently affecting the Ruffle renderer.
 pub(crate) const GRAPHICS_BACKENDS: wgpu::Backends = wgpu::Backends::GL;

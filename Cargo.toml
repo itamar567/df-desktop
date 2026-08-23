@@ -3,6 +3,10 @@ name = "ruffle-dragonfable"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "itmr-dragonfable-launcher"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 arboard = "3.6.1"
@@ -27,6 +31,10 @@ tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 webbrowser = "1.2.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+semver = "1"
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
 wgpu = "27"
 winit = "0.30"
 
@@ -37,3 +45,7 @@ swf = { path = "../ruffle/swf" }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[build-dependencies]
+winresource = "0.1"
+image = { version = "0.25", default-features = false, features = ["png"] }

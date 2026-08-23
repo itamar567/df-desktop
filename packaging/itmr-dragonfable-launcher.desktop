@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=itmr's DragonFable Launcher
+Exec=itmr-dragonfable-launcher
+Icon=itmr-dragonfable-launcher
+Categories=Game;
+Terminal=false
