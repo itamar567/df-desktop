@@ -402,7 +402,10 @@ mod tests {
         for command in commands {
             let mut bytes = Vec::new();
             write_message(&mut bytes, &command).unwrap();
-            assert_eq!(read_message(&mut Cursor::new(bytes)).unwrap(), command);
+            assert_eq!(
+                read_message::<ChildCommand>(&mut Cursor::new(bytes)).unwrap(),
+                command
+            );
         }
     }
 
@@ -415,7 +418,10 @@ mod tests {
         ] {
             let mut bytes = Vec::new();
             write_message(&mut bytes, &event).unwrap();
-            assert_eq!(read_message(&mut Cursor::new(bytes)).unwrap(), event);
+            assert_eq!(
+                read_message::<ChildWindowEvent>(&mut Cursor::new(bytes)).unwrap(),
+                event
+            );
         }
     }
 
