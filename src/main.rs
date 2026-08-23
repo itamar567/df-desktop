@@ -3,10 +3,18 @@
 mod app;
 mod config;
 mod input;
+mod log;
+mod log_process;
+mod log_ui;
+mod log_window;
 mod migration;
 mod navigator;
 mod player;
+mod theme;
 mod ui;
+
+/// GL avoids the Vulkan memory leak currently affecting the Ruffle renderer.
+pub(crate) const GRAPHICS_BACKENDS: wgpu::Backends = wgpu::Backends::GL;
 
 use std::panic::Location;
 
@@ -15,6 +23,10 @@ use tracing_subscriber::EnvFilter;
 use winit::event_loop::EventLoop;
 
 fn main() -> anyhow::Result<()> {
+    if log_process::is_child_process() {
+        return log_process::run_child();
+    }
+
     init_logging();
     install_panic_hook();
 
