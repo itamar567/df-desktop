@@ -397,7 +397,6 @@ impl App {
             self.show_toast("Could not open the download page");
             return;
         }
-        self.show_toast("Opening the download page…");
     }
 
     fn pointer_is_over_launcher(&self, position: PhysicalPosition<f64>) -> bool {
