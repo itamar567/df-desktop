@@ -63,8 +63,11 @@ fn format_panic(payload: Option<&str>, location: Option<&Location<'_>>) -> Strin
 }
 
 fn init_logging() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn,ruffle=info,dragonfable_cache=info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "warn,ruffle=info,dragonfable_cache=info,itmr_dragonfable_launcher=info",
+        )
+    });
 
     std::fs::create_dir_all(config::log_dir()).expect("log dir must be creatable");
     let (file_writer, guard) = tracing_appender::non_blocking(

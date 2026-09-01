@@ -1,11 +1,29 @@
 use egui::{Color32, Frame, Margin, ScrollArea, Stroke};
 
-use crate::log::{LogDisplay, LogSnapshot, LogTab, SharedLogState, parse_log_content};
+use crate::log::{
+    LogDisplay, LogFragment, LogSnapshot, LogTab, SharedLogState, parse_log_content,
+};
 use crate::theme::{ACCENT, LOG_BORDER, LOG_TEXT};
 
 pub const DEFAULT_PANEL_WIDTH: f32 = 320.0;
 const MIN_PANEL_WIDTH: f32 = 300.0;
 const MAX_PANEL_WIDTH: f32 = 800.0;
+
+#[derive(Default)]
+pub struct LogRenderCache {
+    content: String,
+    fragments: Vec<LogFragment>,
+}
+
+impl LogRenderCache {
+    pub fn fragments(&mut self, content: &str) -> &[LogFragment] {
+        if self.content != content {
+            self.fragments = parse_log_content(content);
+            self.content = content.to_owned();
+        }
+        &self.fragments
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct LogUiResponse {
@@ -37,6 +55,7 @@ pub fn side_panel(
     ctx: &egui::Context,
     logs: &SharedLogState,
     width: f32,
+    cache: &mut LogRenderCache,
 ) -> Option<SidePanelOutput> {
     if logs.display() != LogDisplay::SideBySide {
         return None;
@@ -53,7 +72,7 @@ pub fn side_panel(
                 .stroke(Stroke::new(1.0_f32, LOG_BORDER))
                 .inner_margin(Margin::symmetric(8, 8)),
         )
-        .show(ctx, |ui| content(ui, &snapshot, true));
+        .show(ctx, |ui| content(ui, &snapshot, true, cache));
 
     Some(SidePanelOutput {
         width: panel.response.rect.width(),
@@ -65,6 +84,7 @@ pub fn content(
     ui: &mut egui::Ui,
     snapshot: &LogSnapshot,
     show_close_button: bool,
+    cache: &mut LogRenderCache,
 ) -> LogUiResponse {
     let mut response = LogUiResponse::default();
 
@@ -75,17 +95,18 @@ pub fn content(
     }
     ui.separator();
 
+    let fragments = cache.fragments(&snapshot.content);
     ScrollArea::vertical()
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show(ui, |ui| {
-            for fragment in parse_log_content(&snapshot.content) {
+            for fragment in fragments {
                 let color = fragment
                     .color
                     .map(|[r, g, b]| Color32::from_rgb(r, g, b))
                     .unwrap_or(LOG_TEXT);
                 ui.label(
-                    egui::RichText::new(fragment.text)
+                    egui::RichText::new(fragment.text.as_str())
                         .color(color)
                         .monospace()
                         .size(12.0),

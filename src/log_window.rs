@@ -11,7 +11,7 @@ use winit::window::{Window, WindowId};
 
 use crate::GRAPHICS_BACKENDS;
 use crate::log::{LogTab, SharedLogState};
-use crate::log_ui;
+use crate::log_ui::{self, LogRenderCache};
 use crate::theme::{self, LOG_BACKGROUND};
 
 const DEFAULT_SIZE: PhysicalSize<u32> = PhysicalSize::new(360, 600);
@@ -29,6 +29,7 @@ pub struct LogWindow {
     egui_winit: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     descriptors: Arc<Descriptors>,
+    content_cache: LogRenderCache,
     minimized: bool,
 }
 
@@ -82,6 +83,7 @@ impl LogWindow {
             egui_winit,
             egui_renderer,
             descriptors,
+            content_cache: LogRenderCache::default(),
             minimized: false,
         })
     }
@@ -152,10 +154,11 @@ impl LogWindow {
         let raw_input = self.egui_winit.take_egui_input(&self.window);
         let snapshot = logs.snapshot();
         let mut response = log_ui::LogUiResponse::default();
+        let content_cache = &mut self.content_cache;
         let full_output = self.egui_winit.egui_ctx().run(raw_input, |ctx| {
             response = egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(LOG_BACKGROUND))
-                .show(ctx, |ui| log_ui::content(ui, &snapshot, false))
+                .show(ctx, |ui| log_ui::content(ui, &snapshot, false, content_cache))
                 .inner;
         });
         let selected_tab = response.selected_tab();

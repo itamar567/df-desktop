@@ -28,6 +28,7 @@ use crate::config::{self, State};
 use crate::input::{winit_input_to_ruffle_key_descriptor, winit_to_ruffle_text_control};
 use crate::log::{LogDisplay, SharedLogState, new_shared_log_state};
 use crate::log_process::{LogProcess, LogProcessEvent};
+use crate::log_ui::LogRenderCache;
 use crate::log_ui::{self, DEFAULT_PANEL_WIDTH, LogUiResponse};
 use crate::migration;
 use crate::player::{RuffleEvent, build_player, refetch_root_movie};
@@ -102,6 +103,7 @@ pub struct App {
     log_display: LogDisplay,
     log_process: Option<LogProcess>,
     log_panel_width: f32,
+    log_render_cache: LogRenderCache,
 }
 
 impl App {
@@ -265,6 +267,7 @@ impl App {
             log_display: LogDisplay::Hidden,
             log_process: None,
             log_panel_width: DEFAULT_PANEL_WIDTH,
+            log_render_cache: LogRenderCache::default(),
         };
         if matches!(app.screen, Screen::Playing) {
             app.start_game();
@@ -674,6 +677,7 @@ impl App {
                             ctx,
                             &self.log_state,
                             self.log_panel_width,
+                            &mut self.log_render_cache,
                         ) {
                             self.log_panel_width = panel.width;
                             launcher_right_inset = panel.width;
