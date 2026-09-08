@@ -24,6 +24,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+use crate::autoclick::auto_click_if_needed;
 use crate::config::{self, State};
 use crate::input::{winit_input_to_ruffle_key_descriptor, winit_to_ruffle_text_control};
 use crate::log::{LogDisplay, SharedLogState, new_shared_log_state};
@@ -88,6 +89,9 @@ pub struct App {
     last_pointer: PhysicalPosition<f64>,
     modifiers: Modifiers,
     launcher_open: bool,
+    /// When set, cutscene "continue" prompts are detected and clicked
+    /// automatically every frame.
+    auto_click_cutscenes: bool,
     launcher_hit_regions: LauncherHitRegions,
     launcher_pointer_over: bool,
     launcher_pointer_captured: bool,
@@ -257,6 +261,7 @@ impl App {
             last_pointer: PhysicalPosition::new(0.0, 0.0),
             modifiers: Modifiers::default(),
             launcher_open: false,
+            auto_click_cutscenes: false,
             launcher_hit_regions: LauncherHitRegions::default(),
             launcher_pointer_over: false,
             launcher_pointer_captured: false,
@@ -354,6 +359,12 @@ impl App {
         });
     }
 
+    fn toggle_auto_click_cutscenes(&mut self) {
+        self.auto_click_cutscenes = !self.auto_click_cutscenes;
+        let state = if self.auto_click_cutscenes { "enabled" } else { "disabled" };
+        self.show_toast(format!("Auto-click cutscenes {state}"));
+    }
+
     fn clear_game_cache(&mut self) {
         let result = if let Some(cache_handle) = &self.cache_handle {
             cache_handle.clear()
@@ -382,6 +393,7 @@ impl App {
             LauncherAction::ToggleFullscreen => self.toggle_fullscreen(),
             LauncherAction::ClearCache => self.clear_game_cache(),
             LauncherAction::DownloadUpdate => self.open_update_download(),
+            LauncherAction::ToggleAutoClickCutscenes => self.toggle_auto_click_cutscenes(),
         }
         self.launcher_open = false;
         self.window
@@ -728,6 +740,7 @@ impl App {
                         fullscreen,
                         launcher_open,
                         launcher_right_inset,
+                        self.auto_click_cutscenes,
                         self.available_update.as_ref(),
                     );
                 }
@@ -1183,9 +1196,13 @@ impl ApplicationHandler<RuffleEvent> for App {
             let dt = FloatDuration::from_std(new_time.duration_since(self.time));
             if dt.as_millis() > 0.0 {
                 self.time = new_time;
+                let cursor_position = self.window_to_movie_viewport(self.last_pointer);
                 let next_frame = self.player.as_ref().map(|player| {
                     let mut player_lock = player.lock().unwrap();
                     player_lock.tick(dt);
+                    // Runs the same lock scope as the frame tick: the search
+                    // reads the display tree between AVM execution and render.
+                    auto_click_if_needed(&mut player_lock, self.auto_click_cutscenes, Some(cursor_position));
                     new_time + player_lock.time_til_next_frame()
                 });
                 if let Some(next_frame) = next_frame {
@@ -1245,6 +1262,7 @@ enum LauncherAction {
     ToggleFullscreen,
     ClearCache,
     DownloadUpdate,
+    ToggleAutoClickCutscenes,
 }
 
 /// Fires one startup update check; the result arrives as an
@@ -1366,6 +1384,7 @@ fn launcher_ui(
     fullscreen: bool,
     open: bool,
     right_inset: f32,
+    auto_click_cutscenes: bool,
     available_update: Option<&AvailableUpdate>,
 ) -> LauncherResponse {
     use egui::{Align2, Color32, CornerRadius, Frame, Margin, Order, Stroke};
@@ -1405,6 +1424,16 @@ fn launcher_ui(
                         };
                         if launcher_menu_button(ui, fullscreen_text, Some("F11")).clicked() {
                             return Some(LauncherAction::ToggleFullscreen);
+                        }
+                        ui.add_space(5.0);
+                        if launcher_menu_button(
+                            ui,
+                            "Auto-click cutscenes",
+                            auto_click_cutscenes.then_some("ON"),
+                        )
+                        .clicked()
+                        {
+                            return Some(LauncherAction::ToggleAutoClickCutscenes);
                         }
                         ui.add_space(5.0);
                         if launcher_menu_button(ui, "Clear cache", None).clicked() {
